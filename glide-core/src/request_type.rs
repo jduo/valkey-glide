@@ -1,9 +1,15 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use redis::{Cmd, cmd};
+use std::cell::RefCell;
 
 #[cfg(feature = "proto")]
 use crate::command_request::RequestType as ProtobufRequestType;
+
+// Thread-local buffer for command construction to reduce allocations
+thread_local! {
+    static COMMAND_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(1024));
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -442,6 +448,29 @@ fn get_two_word_command(first: &str, second: &str) -> Cmd {
     cmd
 }
 
+// Optimized command creation using thread-local buffer
+fn get_command_optimized(command_name: &str) -> Cmd {
+    COMMAND_BUFFER.with(|buf| {
+        let mut buffer = buf.borrow_mut();
+        buffer.clear();
+        buffer.extend_from_slice(command_name.as_bytes());
+        cmd(command_name)
+    })
+}
+
+fn get_two_word_command_optimized(first: &str, second: &str) -> Cmd {
+    COMMAND_BUFFER.with(|buf| {
+        let mut buffer = buf.borrow_mut();
+        buffer.clear();
+        buffer.extend_from_slice(first.as_bytes());
+        buffer.push(b' ');
+        buffer.extend_from_slice(second.as_bytes());
+        let mut cmd = cmd(first);
+        cmd.arg(second);
+        cmd
+    })
+}
+
 #[cfg(feature = "proto")]
 impl From<::protobuf::EnumOrUnknown<ProtobufRequestType>> for RequestType {
     fn from(value: ::protobuf::EnumOrUnknown<ProtobufRequestType>) -> Self {
@@ -788,16 +817,16 @@ impl RequestType {
         match self {
             RequestType::InvalidRequest => None,
             RequestType::CustomCommand => Some(Cmd::new()),
-            RequestType::Get => Some(cmd("GET")),
-            RequestType::Set => Some(cmd("SET")),
-            RequestType::Ping => Some(cmd("PING")),
-            RequestType::Info => Some(cmd("INFO")),
-            RequestType::Del => Some(cmd("DEL")),
-            RequestType::Select => Some(cmd("SELECT")),
-            RequestType::ConfigGet => Some(get_two_word_command("CONFIG", "GET")),
-            RequestType::ConfigSet => Some(get_two_word_command("CONFIG", "SET")),
-            RequestType::ConfigResetStat => Some(get_two_word_command("CONFIG", "RESETSTAT")),
-            RequestType::ConfigRewrite => Some(get_two_word_command("CONFIG", "REWRITE")),
+            RequestType::Get => Some(get_command_optimized("GET")),
+            RequestType::Set => Some(get_command_optimized("SET")),
+            RequestType::Ping => Some(get_command_optimized("PING")),
+            RequestType::Info => Some(get_command_optimized("INFO")),
+            RequestType::Del => Some(get_command_optimized("DEL")),
+            RequestType::Select => Some(get_command_optimized("SELECT")),
+            RequestType::ConfigGet => Some(get_two_word_command_optimized("CONFIG", "GET")),
+            RequestType::ConfigSet => Some(get_two_word_command_optimized("CONFIG", "SET")),
+            RequestType::ConfigResetStat => Some(get_two_word_command_optimized("CONFIG", "RESETSTAT")),
+            RequestType::ConfigRewrite => Some(get_two_word_command_optimized("CONFIG", "REWRITE")),
             RequestType::Auth => Some(cmd("AUTH")),
             RequestType::AclCat => Some(get_two_word_command("ACL", "CAT")),
             RequestType::AclDelUser => Some(get_two_word_command("ACL", "DELUSER")),
