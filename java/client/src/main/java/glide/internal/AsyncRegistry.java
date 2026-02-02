@@ -1,24 +1,53 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.internal;
 
+import glide.api.models.exceptions.ClosingException;
+import glide.api.models.exceptions.ExecAbortException;
+import glide.api.models.exceptions.RequestException;
+import glide.api.models.exceptions.TimeoutException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * Async registry for correlating native callbacks with Java {@link CompletableFuture}s.
+ *
+ * <p>Responsibilities:
+ *
+ * <ul>
+ *   <li>Maintain a thread-safe mapping from correlation id to the original future
+ *   <li>Enforce per-client max inflight requests in Java (0 = defer to core default)
+ *   <li>Schedule optional Java-side timeouts with cancellable tasks
+ *   <li>Perform atomic cleanup on completion to avoid races and leaks
+ * </ul>
+ *
+ * <p>Timeouts can be enforced at the Java layer (for immediate user feedback) or deferred to the
+ * Rust core (when timeoutMillis = 0). Backpressure defaults and concurrency tuning are handled by
+ * the Rust core.
+ */
 public final class AsyncRegistry {
 
+    /** Thread-safe storage for active futures. Using ConcurrentHashMap for lock-free operations. */
     private static final ConcurrentHashMap<Long, CompletableFuture<Object>> activeFutures =
             new ConcurrentHashMap<>(estimateInitialCapacity());
 
-    private static final ConcurrentHashMap<Long, java.util.concurrent.atomic.AtomicInteger>
-            clientInflightCounts = new ConcurrentHashMap<>();
+    /** Scheduled timeout tasks mapped by correlation ID for cancellation on completion. */
+    private static final ConcurrentHashMap<Long, ScheduledFuture<?>> timeoutTasks =
+            new ConcurrentHashMap<>();
 
-    private static final AtomicLong nextId = new AtomicLong(1);
+    /**
+     * Per-client inflight request counters. Maps client handle to the number of active requests for
+     * that client.
+     */
+    private static final ConcurrentHashMap<Long, AtomicInteger> clientInflightCounts =
+            new ConcurrentHashMap<>();
 
     // ==================== MONITORING COUNTERS ====================
     private static final AtomicLong totalRegistered = new AtomicLong(0);
@@ -28,15 +57,38 @@ public final class AsyncRegistry {
 
     // Track registration time per correlationId to detect stuck futures
     private static final ConcurrentHashMap<Long, Long> registrationTimes = new ConcurrentHashMap<>();
+    // ==================== END MONITORING ====================
 
-    private static final ScheduledExecutorService monitor;
+    /** Thread-safe ID generator for correlation IDs. */
+    private static final AtomicLong nextId = new AtomicLong(1);
+
+    /**
+     * Single-threaded scheduler for timeout tasks. Uses a daemon thread so it won't prevent JVM
+     * shutdown. Tasks are cancellable via {@link ScheduledFuture#cancel(boolean)}.
+     */
+    private static final ScheduledExecutorService timeoutScheduler =
+            Executors.newSingleThreadScheduledExecutor(
+                    r -> {
+                        Thread t = new Thread(r, "GlideTimeoutScheduler");
+                        t.setDaemon(true);
+                        return t;
+                    });
+
+    /** Monitoring scheduler for tracking stuck futures */
+    private static final ScheduledExecutorService monitor =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "AsyncRegistry-Monitor");
+                t.setDaemon(true);
+                return t;
+            });
+
+    private static final Thread shutdownHook =
+            new Thread(AsyncRegistry::shutdown, "AsyncRegistry-Shutdown");
 
     static {
-        monitor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "AsyncRegistry-Monitor");
-            t.setDaemon(true);
-            return t;
-        });
+        if (!"false".equalsIgnoreCase(System.getProperty("glide.autoShutdownHook", "true"))) {
+            Runtime.getRuntime().addShutdownHook(shutdownHook);
+        }
         monitor.scheduleAtFixedRate(AsyncRegistry::printMonitorStats, 10, 10, TimeUnit.SECONDS);
     }
 
@@ -46,7 +98,6 @@ public final class AsyncRegistry {
         long completed = totalCompleted.get();
         long errors = totalErrors.get();
 
-        // Always print if there are pending futures, otherwise print every 6th time (once per minute)
         if (pending > 0) {
             System.err.printf(
                     "[%s] ASYNC REGISTRY | pending=%d | registered=%d | completed=%d | errors=%d%n",
@@ -64,8 +115,8 @@ public final class AsyncRegistry {
             });
         }
     }
-    // ==================== END MONITORING ====================
 
+    /** Estimate initial capacity for the active futures map using inflight limit with margin. */
     private static int estimateInitialCapacity() {
         String env = System.getenv("GLIDE_MAX_INFLIGHT_REQUESTS");
         if (env != null) {
@@ -85,83 +136,161 @@ public final class AsyncRegistry {
             }
         }
 
-        return 2000;
+        return 2000; // Default with margin over core's 1000
     }
 
+    /**
+     * Register future with client-specific inflight limit, client handle for per-client tracking, and
+     * optional Java-side timeout.
+     *
+     * @param future the future to register
+     * @param maxInflightRequests per-client limit (0 = no Java-side limit, defer to core)
+     * @param clientHandle native client handle for tracking
+     * @param timeoutMillis Java-side timeout in milliseconds (0 = use Rust default timeout)
+     * @return correlation ID for native callback
+     */
     public static <T> long register(
-            CompletableFuture<T> future, int maxInflightRequests, long clientHandle) {
+            CompletableFuture<T> future, int maxInflightRequests, long clientHandle, long timeoutMillis) {
         if (future == null) {
             throw new IllegalArgumentException("Future cannot be null");
         }
 
+        // Client-specific inflight limit check
+        // 0 means "use native/core defaults" - no limit enforcement in Java layer
         if (maxInflightRequests > 0) {
-            clientInflightCounts.compute(
-                    clientHandle,
-                    (key, counter) -> {
-                        java.util.concurrent.atomic.AtomicInteger value =
-                                counter != null ? counter : new java.util.concurrent.atomic.AtomicInteger(0);
-
-                        int updated = value.incrementAndGet();
-                        if (updated > maxInflightRequests) {
-                            value.decrementAndGet();
-                            throw new glide.api.models.exceptions.RequestException(
-                                    "Client reached maximum inflight requests");
-                        }
-
-                        return value;
-                    });
+            enforceInflightLimit(clientHandle, maxInflightRequests);
         }
 
         long correlationId = nextId.getAndIncrement();
-        totalRegistered.incrementAndGet();                          // <-- ADD
-        registrationTimes.put(correlationId, System.currentTimeMillis());  // <-- ADD
 
+        // Store the original future
         @SuppressWarnings("unchecked")
         CompletableFuture<Object> originalFuture = (CompletableFuture<Object>) future;
 
+        // Store original future for completion by native code
         activeFutures.put(correlationId, originalFuture);
 
-        originalFuture.whenComplete(
-                (result, throwable) -> {
-                    activeFutures.remove(correlationId);
-                    registrationTimes.remove(correlationId);        // <-- ADD
+        // Track for monitoring
+        totalRegistered.incrementAndGet();
+        registrationTimes.put(correlationId, System.currentTimeMillis());
 
-                    if (throwable != null) {                        // <-- ADD
-                        totalErrors.incrementAndGet();
-                    } else {
-                        totalCompleted.incrementAndGet();
-                    }
+        // Schedule Java-side timeout if configured (0 = defer to Rust core timeout)
+        if (timeoutMillis > 0) {
+            scheduleTimeout(correlationId, originalFuture, timeoutMillis);
+        }
 
-                    if (maxInflightRequests > 0) {
-                        clientInflightCounts.compute(
-                                clientHandle,
-                                (key, counter) -> {
-                                    if (counter == null) {
-                                        return null;
-                                    }
-
-                                    int remaining = counter.decrementAndGet();
-
-                                    return remaining <= 0 ? null : counter;
-                                });
-                    }
-                });
+        // Set up cleanup on the original future
+        // This ensures proper resource cleanup when completed
+        setupCleanup(correlationId, originalFuture, maxInflightRequests, clientHandle);
 
         return correlationId;
     }
 
-    public static boolean completeCallback(long correlationId, Object result) {
-        CompletableFuture<Object> future = activeFutures.get(correlationId);
-
-        if (future == null) {
-            return false;
-        }
-
-        boolean completed = future.complete(result);
-
-        return completed;
+    /** Enforce per-client inflight limit, throwing RequestException if exceeded. */
+    private static void enforceInflightLimit(long clientHandle, int maxInflightRequests) {
+        clientInflightCounts.compute(
+                clientHandle,
+                (key, counter) -> {
+                    AtomicInteger value = counter != null ? counter : new AtomicInteger(0);
+                    if (value.incrementAndGet() > maxInflightRequests) {
+                        value.decrementAndGet();
+                        throw new RequestException("Client reached maximum inflight requests");
+                    }
+                    return value;
+                });
     }
 
+    /**
+     * Schedule a cancellable timeout task. If the request doesn't complete within timeoutMillis, the
+     * future is completed exceptionally with TimeoutException and the native layer is notified.
+     */
+    private static void scheduleTimeout(
+            long correlationId, CompletableFuture<Object> future, long timeoutMillis) {
+        ScheduledFuture<?> task =
+                timeoutScheduler.schedule(
+                        () -> {
+                            timeoutTasks.remove(correlationId);
+                            if (future.completeExceptionally(new TimeoutException("Request timed out"))) {
+                                GlideNativeBridge.markTimedOut(correlationId);
+                            }
+                        },
+                        timeoutMillis,
+                        TimeUnit.MILLISECONDS);
+        timeoutTasks.put(correlationId, task);
+    }
+
+    /**
+     * Set up cleanup handler for when the future completes (success, error, or timeout). Performs
+     * atomic cleanup to avoid races and leaks.
+     */
+    private static void setupCleanup(
+            long correlationId,
+            CompletableFuture<Object> future,
+            int maxInflightRequests,
+            long clientHandle) {
+        future.whenComplete(
+                (result, error) -> {
+                    // Atomic cleanup - no race conditions
+                    activeFutures.remove(correlationId);
+                    
+                    // Track completion for monitoring
+                    registrationTimes.remove(correlationId);
+                    if (error != null) {
+                        totalErrors.incrementAndGet();
+                    }
+                    totalCompleted.incrementAndGet();
+
+                    // Cancel the timeout task if it hasn't fired yet
+                    // Using cancel(false) to avoid interrupting the scheduler thread
+                    ScheduledFuture<?> timeoutTask = timeoutTasks.remove(correlationId);
+                    if (timeoutTask != null) {
+                        timeoutTask.cancel(false);
+                    }
+
+                    // Decrement per-client counter if applicable
+                    if (maxInflightRequests > 0) {
+                        decrementInflightCount(clientHandle);
+                    }
+                });
+    }
+
+    /** Decrement inflight count for client, removing the entry when it reaches zero. */
+    private static void decrementInflightCount(long clientHandle) {
+        clientInflightCounts.computeIfPresent(
+                clientHandle,
+                (key, counter) -> {
+                    int remaining = counter.decrementAndGet();
+                    // Clean up the entry when no more inflight requests
+                    // to avoid leaking counters for inactive clients
+                    return remaining <= 0 ? null : counter;
+                });
+    }
+
+    /**
+     * Complete callback with proper race condition handling. Returns false if already completed or
+     * timed out.
+     *
+     * @param correlationId the correlation ID from register()
+     * @param result the result to complete with
+     * @return true if completed, false if already done
+     */
+    public static boolean completeCallback(long correlationId, Object result) {
+        CompletableFuture<Object> future = activeFutures.get(correlationId);
+        // complete() returns false if already completed
+        // This prevents IllegalStateException from completing twice
+        // Note: cleanup happens automatically in whenComplete()
+        return future != null && future.complete(result);
+    }
+
+    /**
+     * Complete with error using a structured error code from native layer. Codes map to glide-core
+     * RequestErrorType: 0=Unspecified, 1=ExecAbort, 2=Timeout, 3=Disconnect.
+     *
+     * @param correlationId the correlation ID from register()
+     * @param errorTypeCode error type code from native layer
+     * @param errorMessage error message from native layer
+     * @return true if completed, false if already done
+     */
     public static boolean completeCallbackWithErrorCode(
             long correlationId, int errorTypeCode, String errorMessage) {
         CompletableFuture<Object> future = activeFutures.get(correlationId);
@@ -176,71 +305,87 @@ public final class AsyncRegistry {
 
         RuntimeException ex;
         switch (errorTypeCode) {
-            case 2: // TIMEOUT
-                ex = new glide.api.models.exceptions.TimeoutException(msg);
+            case 2:
+                ex = new TimeoutException(msg);
                 break;
-            case 3: // DISCONNECT
-                ex = new glide.api.models.exceptions.ClosingException(msg);
+            case 3:
+                ex = new ClosingException(msg);
                 break;
-            case 1: // EXEC_ABORT
-                ex = new glide.api.models.exceptions.ExecAbortException(msg);
+            case 1:
+                ex = new ExecAbortException(msg);
                 break;
-            case 0: // UNSPECIFIED
             default:
-                ex = new glide.api.models.exceptions.RequestException(msg);
+                ex = new RequestException(msg);
                 break;
         }
 
         return future.completeExceptionally(ex);
     }
 
+    /** Get current pending operation count. */
     public static int getPendingCount() {
         return activeFutures.size();
     }
 
+    /** Shutdown cleanup - cancel all pending operations during client shutdown. */
     public static void shutdown() {
-        monitor.shutdownNow();                                      // <-- ADD
-        activeFutures
-                .values()
-                .forEach(
-                        future -> {
-                            if (!future.isDone()) {
-                                future.cancel(true);
-                            }
-                        });
+        // Cancel timeout tasks without interrupting (they're just scheduled, not running)
+        timeoutTasks.values().forEach(task -> task.cancel(false));
+        timeoutTasks.clear();
 
+        // Cancel user futures with interrupt (may be blocked waiting)
+        activeFutures.values().forEach(future -> future.cancel(true));
         activeFutures.clear();
         clientInflightCounts.clear();
-        registrationTimes.clear();                                  // <-- ADD
+
+        // Shutdown the timeout scheduler
+        timeoutScheduler.shutdownNow();
     }
 
+    /** Clean up per-client tracking when a client is closed. */
     public static void cleanupClient(long clientHandle) {
         clientInflightCounts.remove(clientHandle);
     }
 
+    /** Reset all internal state. Intended for test isolation and client shutdown cleanup. */
     public static void reset() {
+        // Cancel timeout tasks without interrupting
+        timeoutTasks.values().forEach(task -> task.cancel(false));
+        timeoutTasks.clear();
         activeFutures.clear();
         clientInflightCounts.clear();
-        registrationTimes.clear();                                  // <-- ADD
         nextId.set(1);
-        totalRegistered.set(0);                                     // <-- ADD
-        totalCompleted.set(0);                                      // <-- ADD
-        totalErrors.set(0);                                         // <-- ADD
     }
 
-    private static final Thread shutdownHook =
-            new Thread(AsyncRegistry::shutdown, "AsyncRegistry-Shutdown");
-
-    static {
-        if (!"false".equalsIgnoreCase(System.getProperty("glide.autoShutdownHook", "true"))) {
-            Runtime.getRuntime().addShutdownHook(shutdownHook);
-        }
+    /**
+     * Returns the count of pending timeout tasks. Intended for testing to verify timeout tasks are
+     * cancelled properly and don't accumulate.
+     *
+     * @return number of active timeout tasks
+     */
+    public static int getPendingTimeoutCount() {
+        return timeoutTasks.size();
     }
 
+    /**
+     * Returns the count of active futures. Intended for testing to verify futures are cleaned up
+     * properly.
+     *
+     * @return number of active futures
+     */
+    public static int getActiveFutureCount() {
+        return activeFutures.size();
+    }
+
+    /**
+     * Remove the automatic shutdown hook, allowing users to manage shutdown manually. Call this if
+     * you want to control shutdown behavior yourself.
+     */
     public static void removeShutdownHook() {
         try {
             Runtime.getRuntime().removeShutdownHook(shutdownHook);
         } catch (IllegalStateException ignored) {
+            // Hook was never registered or already removed
         }
     }
 }
