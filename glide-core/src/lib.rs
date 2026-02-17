@@ -14,6 +14,7 @@ pub mod errors;
 pub mod scripts_container;
 pub use client::ConnectionRequest;
 pub mod cluster_scan_container;
+pub mod connection_pool;
 pub mod iam;
 pub mod pubsub;
 pub mod request_type;

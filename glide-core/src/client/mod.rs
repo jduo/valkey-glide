@@ -259,6 +259,8 @@ pub struct Client {
     // Optional compression manager for automatic compression/decompression
     compression_manager: Option<Arc<CompressionManager>>,
     pubsub_synchronizer: Arc<dyn PubSubSynchronizer>,
+    // Connection pool for dedicated connections
+    connection_pool: Arc<crate::connection_pool::ConnectionPool>,
 }
 
 async fn run_with_timeout<T>(
@@ -1209,6 +1211,27 @@ impl Client {
         iam_manager.refresh_token().await;
         Ok(())
     }
+
+    /// Acquire a dedicated connection handle for isolated command execution.
+    /// 
+    /// This is useful for WATCH/transaction scenarios where commands must not
+    /// be interleaved with other operations on the same connection.
+    ///
+    /// # Returns
+    /// A `ConnectionHandle` that can be used with `send_command_dedicated` and
+    /// must be released with `release_dedicated` when done.
+    pub async fn acquire_dedicated(&self) -> crate::connection_pool::ConnectionHandle {
+        self.connection_pool.acquire_dedicated().await
+    }
+
+    /// Release a dedicated connection handle and return connections to the pool.
+    ///
+    /// # Arguments
+    /// * `handle` - The connection handle to release
+    pub async fn release_dedicated(&self, handle: crate::connection_pool::ConnectionHandle) {
+        self.connection_pool.release_dedicated(handle).await
+    }
+    }
 }
 /// Trait for executing PubSub commands on the internal client wrapper
 pub trait PubSubCommandApplier: Send + Sync {
@@ -1695,6 +1718,7 @@ impl Client {
                 compression_manager: compression_manager.clone(),
                 iam_token_manager: None,
                 pubsub_synchronizer: pubsub_synchronizer.clone(),
+                connection_pool: Arc::new(crate::connection_pool::ConnectionPool::new()),
             };
 
             let client_arc = Arc::new(RwLock::new(client));
