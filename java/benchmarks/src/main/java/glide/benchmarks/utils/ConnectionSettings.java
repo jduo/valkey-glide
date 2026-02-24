@@ -7,11 +7,14 @@ public class ConnectionSettings {
     public final int port;
     public final boolean useSsl;
     public final boolean clusterMode;
+    public final boolean tcpNoDelay; // ADD THIS
 
-    public ConnectionSettings(String host, int port, boolean useSsl, boolean clusterMode) {
+    public ConnectionSettings(
+            String host, int port, boolean useSsl, boolean clusterMode, boolean tcpNoDelay) {
         this.host = host;
         this.port = port;
         this.useSsl = useSsl;
         this.clusterMode = clusterMode;
+        this.tcpNoDelay = tcpNoDelay;
     }
 }

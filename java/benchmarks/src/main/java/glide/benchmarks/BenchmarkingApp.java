@@ -2,10 +2,12 @@
 package glide.benchmarks;
 
 import static glide.benchmarks.utils.Benchmarking.testClientSetGet;
+import glide.api.logging.Logger;
 
 import glide.benchmarks.clients.glide.GlideAsyncClient;
 import glide.benchmarks.clients.jedis.JedisClient;
 import glide.benchmarks.clients.lettuce.LettuceAsyncClient;
+import glide.benchmarks.utils.OperationType;
 import java.util.Arrays;
 import java.util.Optional;
 import java.util.stream.Stream;
@@ -27,6 +29,7 @@ public class BenchmarkingApp {
         CommandLineParser parser = new DefaultParser();
         Options options = getOptions();
         RunConfiguration runConfiguration = new RunConfiguration();
+        Logger.init(Logger.Level.DEBUG);
         try {
             // parse the command line arguments
             CommandLine line = parser.parse(options, args);
@@ -127,6 +130,52 @@ public class BenchmarkingApp {
                         .hasArg(false)
                         .desc("Verbose logs [false]")
                         .build());
+        options.addOption(
+                Option.builder()
+                        .longOpt("tps")
+                        .hasArg(true)
+                        .desc("Target transactions per second (0 = unlimited) [0]")
+                        .build());
+
+        options.addOption(
+                Option.builder()
+                        .longOpt("operations")
+                        .hasArg(true)
+                        .desc("Operation type: all|read|write|delete [all]")
+                        .build());
+
+        options.addOption(
+                Option.builder()
+                        .longOpt("warmupKeys")
+                        .hasArg(true)
+                        .desc("Number of keys to pre-populate for read benchmarks [100000]")
+                        .build());
+
+        // ADD THESE NEW OPTIONS
+        options.addOption(
+                Option.builder()
+                        .longOpt("duration")
+                        .hasArg(true)
+                        .desc("Duration to run in seconds, 0 = use iterations [0]")
+                        .build());
+        options.addOption(
+                Option.builder()
+                        .longOpt("metricsDir")
+                        .hasArg(true)
+                        .desc("Directory for metrics CSV output [./metrics]")
+                        .build());
+        options.addOption(
+                Option.builder()
+                        .longOpt("metricsInterval")
+                        .hasArg(true)
+                        .desc("Metrics collection interval in seconds [60]")
+                        .build());
+        options.addOption(
+                Option.builder()
+                        .longOpt("tcpNoDelay")
+                        .hasArg(false)
+                        .desc("Enable TCP_NODELAY [false]")
+                        .build());
 
         return options;
     }
@@ -189,10 +238,54 @@ public class BenchmarkingApp {
             runConfiguration.dataSize = parseIntListOption(line.getOptionValue("dataSize"));
         }
 
+        if (line.hasOption("tps")) {
+            runConfiguration.targetTps = Integer.parseInt(line.getOptionValue("tps"));
+        }
+
+        if (line.hasOption("operations")) {
+            String ops = line.getOptionValue("operations").toLowerCase();
+            switch (ops) {
+                case "read":
+                    runConfiguration.operationType = OperationType.READ_ONLY;
+                    break;
+                case "write":
+                    runConfiguration.operationType = OperationType.WRITE_ONLY;
+                    break;
+                case "delete": // <-- ADD THIS
+                    runConfiguration.operationType = OperationType.DELETE_ONLY;
+                    break;
+                case "all":
+                    runConfiguration.operationType = OperationType.ALL;
+                    break;
+                default:
+                    throw new ParseException(
+                            "Invalid operations type (" + ops + "), must be (all|read|write)");
+            }
+        }
+
+        if (line.hasOption("warmupKeys")) {
+            runConfiguration.warmupKeyCount = Integer.parseInt(line.getOptionValue("warmupKeys"));
+        }
+
+        // ADD THESE NEW OPTION PARSERS
+        if (line.hasOption("duration")) {
+            runConfiguration.durationSeconds = Long.parseLong(line.getOptionValue("duration"));
+        }
+
+        if (line.hasOption("metricsDir")) {
+            runConfiguration.metricsOutputDir = line.getOptionValue("metricsDir");
+        }
+
+        if (line.hasOption("metricsInterval")) {
+            runConfiguration.metricsIntervalSeconds =
+                    Integer.parseInt(line.getOptionValue("metricsInterval"));
+        }
+
         runConfiguration.tls = line.hasOption("tls");
         runConfiguration.clusterModeEnabled = line.hasOption("clusterModeEnabled");
         runConfiguration.minimal = line.hasOption("minimal");
         runConfiguration.debugLogging = line.hasOption("debugLogging");
+        runConfiguration.tcpNoDelay = line.hasOption("tcpNoDelay");
 
         return runConfiguration;
     }
@@ -251,6 +344,13 @@ public class BenchmarkingApp {
         public boolean clusterModeEnabled;
         public boolean debugLogging = false;
         public boolean minimal = false;
+        public int targetTps = 0; // 0 = unlimited
+        public OperationType operationType = OperationType.ALL; // ADD THIS
+        public int warmupKeyCount = 100000; // ADD THIS - number of keys to pre-populate
+        public long durationSeconds = 0; // ADD THIS - 0 means use iterations
+        public String metricsOutputDir = "./metrics";
+        public int metricsIntervalSeconds = 60;
+        public boolean tcpNoDelay = false; // ADD THIS
 
         public RunConfiguration() {
             configuration = "Release";
@@ -267,6 +367,12 @@ public class BenchmarkingApp {
             tls = false;
             clusterModeEnabled = false;
             minimal = false;
+            operationType = OperationType.ALL; // ADD THIS
+            warmupKeyCount = 100000; // ADD THIS
+            durationSeconds = 0;
+            metricsOutputDir = "./metrics";
+            metricsIntervalSeconds = 60;
+            tcpNoDelay = false; // ADD THIS
         }
     }
 }

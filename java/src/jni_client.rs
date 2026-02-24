@@ -105,7 +105,7 @@ pub(crate) fn get_runtime() -> &'static Runtime {
             DEFAULT_RUNTIME_WORKER_THREADS
         };
 
-        tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(worker_threads)
             .max_blocking_threads(worker_threads * 2)
             .enable_all()
@@ -113,7 +113,23 @@ pub(crate) fn get_runtime() -> &'static Runtime {
             .thread_stack_size(2 * 1024 * 1024)
             .thread_keep_alive(std::time::Duration::from_secs(60))
             .build()
-            .expect("Failed to create Tokio runtime")
+            .expect("Failed to create runtime");
+
+        // Spawn a monitor task
+        let handle = runtime.handle().clone();
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let metrics = handle.metrics();
+                log::warn!(
+                    "TOKIO METRICS | workers={}",
+                    metrics.num_workers(),
+                    
+                );
+            }
+        });
+
+        runtime
     })
 }
 
@@ -442,7 +458,10 @@ pub fn complete_callback(
 ) {
     let sender = init_callback_workers();
     if let Err(e) = sender.send((jvm, callback_id, result, binary_mode)) {
-        log::error!("Callback queue send failed: {e}");
+        log::error!(
+            "Callback queue send FAILED! callback_id={} | error={} | FUTURE WILL HANG FOREVER",
+            callback_id, e
+        );
     }
 }
 
