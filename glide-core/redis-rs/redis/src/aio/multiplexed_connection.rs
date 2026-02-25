@@ -193,6 +193,10 @@ where
             } => {
                 match result {
                     Ok(Value::ServerError(err)) if *is_transaction => {
+                        println!(
+                            "Transaction ServerError received: {}. This indicates an error occurred between MULTI and EXEC.",
+                            err
+                        );
                         // In transactions, `count` is always 1 because the final result is a single array (`offset + count = expected_response_count`).
                         // If we receive a `ServerError` here, it means the error occurred between `MULTI` and `EXEC`.
                         // After `EXEC`, the response is always a single array of results, so any error at this stage must have happened before `EXEC` was sent.
@@ -202,9 +206,11 @@ where
                         }
                     }
                     Ok(item) => {
+                        println!("Pipeline response received: {:?}", item);
                         buffer.push(item);
                     }
                     Err(err) => {
+                        println!("Pipeline error received: {:?}", err);
                         if first_err.is_none() {
                             *first_err = Some(err);
                         }

@@ -2647,6 +2647,12 @@ where
                 sub_pipeline,
                 pipeline_retry_strategy,
             } => {
+                println!(
+                    "try_request: Pipeline command received. Atomic: {}, Sub-pipeline: {}",
+                    pipeline.is_atomic(),
+                    sub_pipeline
+                );
+                println!("Pipeline commands:\n{:?}", pipeline);
                 if pipeline.is_atomic() || sub_pipeline {
                     // If the pipeline is atomic (i.e., a transaction) or if the pipeline is already splitted into sub-pipelines (i.e., the pipeline is already routed to a specific node), we can send it as is, with no need to split it into sub-pipelines.
                     Self::try_pipeline_request(

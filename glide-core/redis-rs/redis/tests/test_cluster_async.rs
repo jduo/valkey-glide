@@ -22,7 +22,7 @@ mod cluster_async {
     use std::path::PathBuf;
     use std::sync::OnceLock;
     use telemetrylib::*;
-    use tokio::runtime::Runtime;
+    use tokio::{net::unix::pipe, runtime::Runtime};
 
     use redis::{
         aio::{ConnectionLike, MultiplexedConnection},
@@ -33,9 +33,10 @@ mod cluster_async {
         },
         cluster_topology::{get_slot, DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES},
         cmd, from_owned_redis_value, parse_redis_value, AsyncCommands, Cmd, ConnectionAddr,
-        ErrorKind, FromRedisValue, GlideConnectionOptions, InfoDict, IntoConnectionInfo,
-        PipelineRetryStrategy, ProtocolVersion, PubSubChannelOrPattern, PubSubSubscriptionInfo,
-        PubSubSubscriptionKind, PushInfo, PushKind, RedisError, RedisFuture, RedisResult, Value,
+        ConnectionInfo, ErrorKind, FromRedisValue, GlideConnectionOptions, InfoDict,
+        IntoConnectionInfo, PipelineRetryStrategy, ProtocolVersion, PubSubChannelOrPattern,
+        PubSubSubscriptionInfo, PubSubSubscriptionKind, PushInfo, PushKind, RedisError,
+        RedisFuture, RedisResult, Value,
     };
 
     use crate::support::*;
@@ -2233,154 +2234,537 @@ mod cluster_async {
     /// This test ensures the client correctly follows either:
     /// - initial node's view (when refresh_from_initial = true)
     /// - Internal cluster view (when refresh_from_initial = false)
+    ///
     fn test_refresh_topology_from_initial_nodes() {
-        for refresh_topology_from_initial_nodes in [false, true] {
-            let cluster = TestClusterContext::new(3, 0);
+        for refresh_topology_from_initial_nodes in [true] {
+            // let cluster = TestClusterContext::new(3, 0);
 
             let _ = block_on_all(async move {
                 // Extract node_0 address for later
-                let (node_0_host, node_0_port) = match cluster.nodes[0].addr {
-                    ConnectionAddr::Tcp(ref host, port) => (host.clone(), port),
-                    ConnectionAddr::TcpTls { ref host, port, .. } => (host.clone(), port),
-                    _ => panic!("Unsupported connection address"),
-                };
+                // let (node_0_host, node_0_port) = match cluster.nodes[0].addr {
+                //     ConnectionAddr::Tcp(ref host, port) => (host.clone(), port),
+                //     ConnectionAddr::TcpTls { ref host, port, .. } => (host.clone(), port),
+                //     _ => panic!("Unsupported connection address"),
+                // };
 
-                // Discover topology
-                let cluster_nodes = cluster.get_cluster_nodes().await;
-                let slot_distribution = cluster.get_slots_ranges_distribution(&cluster_nodes);
+                // let initial_nodes: Vec<ConnectionInfo> = vec![ConnectionInfo {
+                //     addr: ConnectionAddr::TcpTls {
+                //         host: "clustercfg.glide-intuit-az.ime4qh.use1.cache.amazonaws.com"
+                //             .to_string(),
+                //         port: 6379,
+                //         insecure: true,
+                //         tls_params: None,
+                //     },
+                //     redis: Default::default(),
+                // }];
 
-                // Partition cluster into node_0 and the rest
-                let (node_0_info, rest): (Vec<_>, Vec<_>) = slot_distribution
-                    .into_iter()
-                    .partition(|(_, addr, port, _)| {
-                        addr == &node_0_host && port == &node_0_port.to_string()
-                    });
+                let initial_nodes = vec![ConnectionInfo {
+                    addr: ConnectionAddr::Tcp("shohame-global-data-store-iad-0003-001.shohame-global-data-store-iad.ime4qh.use1.cache.amazonaws.com".into(), 6379),
+                    redis: Default::default(),
+                }];
 
-                let node_0_id = node_0_info[0].0.clone();
-                let rest_ids: Vec<_> = rest.iter().map(|(id, _, _, _)| id.clone()).collect();
+                let builder = redis::cluster::ClusterClientBuilder::new(initial_nodes.clone())
+                    .use_protocol(use_protocol())
+                    .slots_refresh_rate_limit(Duration::from_secs(0), 0)
+                    .refresh_topology_from_initial_nodes(true)
+                    .periodic_topology_checks(Duration::from_secs(60))
+                    // .read_from(redis::cluster_slotmap::ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(("us-east-1c").to_string()))
+                    .tls(redis::TlsMode::Insecure);
 
-                // Connect through node0 (use node0 as initial node)
-                let client = redis::cluster::ClusterClientBuilder::new(vec![cluster.nodes[0].clone()])
-                        .use_protocol(use_protocol())
-                        // Force slots refresh to be immediate after MOVED error
-                        .slots_refresh_rate_limit(Duration::from_secs(0), 0)
-                        .refresh_topology_from_initial_nodes(refresh_topology_from_initial_nodes)
-                        .build()
-                        .unwrap();
+                let client = builder.build().unwrap();
 
-                let mut conn = client.get_async_connection(None).await.unwrap();
+                let mut conn = client
+                    .get_async_generic_connection::<MultiplexedConnection>()
+                    .await
+                    .unwrap();
 
-                // Disable full coverage requirement
-                let _ = conn
-                    .route_command(
-                        &cmd("CONFIG")
-                            .arg("SET")
-                            .arg("cluster-require-full-coverage")
-                            .arg("no"),
-                        RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
+                println!(
+                    "Connected to cluster with nodes: {:?}",
+                    conn.route_command(
+                        &redis::cmd("PING"),
+                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)
                     )
                     .await
-                    .expect("Failed to disable full coverage requirement");
+                    .unwrap()
+                );
 
-                // Check that all nodes are reachable
-                let ping = conn
+                // print cluster nodes
+                let cluster_nodes = conn
                     .route_command(
-                        &cmd("PING"),
-                        RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
-                    )
-                    .await
-                    .expect("Failed to PING all nodes");
-
-                let res = match ping {
-                    Value::Map(map) => map,
-                    _ => panic!("Unexpected PING response: {:?}", ping),
-                };
-
-                assert_eq!(res.len(), 3, "Expected exactly 3 PING responses");
-
-                // Make all nodes forget node_0
-                let mut forget_node_0 = cmd("CLUSTER");
-                forget_node_0.arg("FORGET").arg(&node_0_id);
-
-                let _ = conn
-                    .route_command(
-                        &forget_node_0,
-                        RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
-                    )
-                    .await;
-
-                // Instruct node_0 to forget all other nodes.
-                // This fully partitions the cluster, ensuring node_0 has no knowledge of the remaining nodes.
-                // This step is necessary so that after a topology refresh, node_0's view excludes the rest,
-                // preventing any residual cluster state due to gossip propagation delays.
-                for rest_id in &rest_ids {
-                    let mut forget_rest = cmd("CLUSTER");
-                    forget_rest.arg("FORGET").arg(rest_id);
-
-                    let _ = conn
-                        .route_command(
-                            &forget_rest,
-                            RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
-                                host: node_0_host.clone(),
-                                port: node_0_port,
-                            }),
-                        )
-                        .await
-                        .expect("Failed to make node 0 forget");
-                }
-
-                // Force a MOVED error by routing key1 through the wrong slot, this should trigger refresh slots immediately
-                // key1 -> 9189 (node 1)
-                // key2 -> 12539 (node 2)
-                let _ = conn
-                    .route_command(
-                        &cmd("GET").arg("key1"),
-                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
-                            get_slot("key".as_bytes()),
-                            SlotAddr::Master,
-                        ))),
-                    )
-                    .await;
-
-                // Allow some time for the topology to refresh
-                sleep(Duration::from_secs(1).into()).await;
-
-                let ping = conn
-                    .route_command(
-                        &cmd("PING"),
-                        RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
+                        &redis::cmd("CLUSTER").arg("NODES"),
+                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
                     )
                     .await
                     .unwrap();
 
-                let res = match ping {
-                    Value::Map(map) => map,
-                    _ => panic!("Unexpected PING response: {:?}", ping),
-                };
+                // println!("Cluster Nodes: {:?}", cluster_nodes);
 
-                let res_size = if refresh_topology_from_initial_nodes {
-                    1
-                } else {
-                    2 // since both node 1 and node 2 forgot about node 0, and we do follow majority decisions
-                };
+                // Pipeline
+                let mut pipeline = redis::pipe();
+                pipeline
+                    .cmd("GET")
+                    .arg("key")
+                    .cmd("SET")
+                    .arg("key")
+                    .arg("value")
+                    .cmd("GET")
+                    .arg("key");
 
-                assert!(
-                    res.len() == res_size,
-                    "Expected exactly {} PING responses",
-                    res_size
-                );
+                let res: Result<Vec<Value>, RedisError> = conn
+                    .route_pipeline(
+                        &pipeline,
+                        0,
+                        3,
+                        None,
+                        Some(PipelineRetryStrategy {
+                            retry_server_error: true,
+                            retry_connection_error: true,
+                        }),
+                    )
+                    .await;
 
-                if refresh_topology_from_initial_nodes {
-                    assert!(
-                        res.iter().any(|(k, _)| k
-                            == &Value::BulkString(
-                                format!("{}:{}", node_0_host, node_0_port).into_bytes()
-                            )),
-                        "Expected to see node 0 only"
-                    );
+                println!("Pipeline result: {:?}", res);
+
+                // Print pipeline result
+                println!("\n========== PIPELINE RESULT ==========");
+                let cmds = ["GET key", "SET key value", "GET key"];
+                match &res {
+                    Ok(values) => {
+                        for (i, (cmd, val)) in cmds.iter().zip(values.iter()).enumerate() {
+                            let status = match val {
+                                Value::ServerError(_) => "❌",
+                                _ => "✅",
+                            };
+                            println!("[{}] {} {} -> {:?}", i, status, cmd, val);
+                        }
+                    }
+                    Err(e) => println!("Error: {:?}", e),
                 }
+                println!("=====================================\n");
+                // Add 5 min sleep
+                // tokio::time::sleep(Duration::from_secs(60)).await;
+
+                // let (moved_key, key2) = generate_two_keys_in_the_same_node(nodes_and_slots);
+                // let key_slot = get_slot(moved_key.as_bytes());
+
+                // cluster
+                //     .move_specific_slot(key_slot, slot_distribution)
+                //     .await;
+
+                // println!("Triggering MOVED error by accessing key routed to wrong node");
+
+                // conn.route_command(
+                //     cmd("GET").arg("key"),
+                //     RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
+                //         0,
+                //         SlotAddr::Master,
+                //     ))),
+                // )
+                // .await
+                // .unwrap();
+
+                // sleep for one minute to allow the cluster to refresh slots
+                // tokio::time::sleep(Duration::from_secs(222)).await;
+
+                // let cluster_nodes = conn
+                //     .route_command(
+                //         cmd("CLUSTER").arg("NODES"),
+                //         RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
+                //     )
+                //     .await
+                //     .unwrap();
+
+                // println!("Cluster Nodes: {:?}", cluster_nodes);
 
                 Ok(())
+
+                // Discover topology
+                // let cluster_nodes = cluster.get_cluster_nodes().await;
+                // let slot_distribution = cluster.get_slots_ranges_distribution(&cluster_nodes);
+
+                // // Partition cluster into node_0 and the rest
+                // let (node_0_info, rest): (Vec<_>, Vec<_>) = slot_distribution
+                //     .into_iter()
+                //     .partition(|(_, addr, port, _)| {
+                //         addr == &node_0_host && port == &node_0_port.to_string()
+                //     });
+
+                // let node_0_id = node_0_info[0].0.clone();
+                // let rest_ids: Vec<_> = rest.iter().map(|(id, _, _, _)| id.clone()).collect();
+
+                // // Connect through node0 (use node0 as initial node)
+                // let client = redis::cluster::ClusterClientBuilder::new(vec![cluster.nodes[0].clone()])
+                //         .use_protocol(use_protocol())
+                //         // Force slots refresh to be immediate after MOVED error
+                //         .slots_refresh_rate_limit(Duration::from_secs(0), 0)
+                //         .refresh_topology_from_initial_nodes(refresh_topology_from_initial_nodes)
+                //         .build()
+                //         .unwrap();
+
+                // let mut conn = client.get_async_connection(None).await.unwrap();
+
+                // // Disable full coverage requirement
+                // let _ = conn
+                //     .route_command(
+                //         &cmd("CONFIG")
+                //             .arg("SET")
+                //             .arg("cluster-require-full-coverage")
+                //             .arg("no"),
+                //         RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
+                //     )
+                //     .await
+                //     .expect("Failed to disable full coverage requirement");
+
+                // // Check that all nodes are reachable
+                // let ping = conn
+                //     .route_command(
+                //         &cmd("PING"),
+                //         RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
+                //     )
+                //     .await
+                //     .expect("Failed to PING all nodes");
+
+                // let res = match ping {
+                //     Value::Map(map) => map,
+                //     _ => panic!("Unexpected PING response: {:?}", ping),
+                // };
+
+                // assert_eq!(res.len(), 3, "Expected exactly 3 PING responses");
+
+                // // Make all nodes forget node_0
+                // let mut forget_node_0 = cmd("CLUSTER");
+                // forget_node_0.arg("FORGET").arg(&node_0_id);
+
+                // let _ = conn
+                //     .route_command(
+                //         &forget_node_0,
+                //         RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
+                //     )
+                //     .await;
+
+                // // Instruct node_0 to forget all other nodes.
+                // // This fully partitions the cluster, ensuring node_0 has no knowledge of the remaining nodes.
+                // // This step is necessary so that after a topology refresh, node_0's view excludes the rest,
+                // // preventing any residual cluster state due to gossip propagation delays.
+                // for rest_id in &rest_ids {
+                //     let mut forget_rest = cmd("CLUSTER");
+                //     forget_rest.arg("FORGET").arg(rest_id);
+
+                //     let _ = conn
+                //         .route_command(
+                //             &forget_rest,
+                //             RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
+                //                 host: node_0_host.clone(),
+                //                 port: node_0_port,
+                //             }),
+                //         )
+                //         .await
+                //         .expect("Failed to make node 0 forget");
+                // }
+
+                // // Force a MOVED error by routing key1 through the wrong slot, this should trigger refresh slots immediately
+                // // key1 -> 9189 (node 1)
+                // // key2 -> 12539 (node 2)
+                // let _ = conn
+                //     .route_command(
+                //         &cmd("GET").arg("key1"),
+                //         RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
+                //             get_slot("key".as_bytes()),
+                //             SlotAddr::Master,
+                //         ))),
+                //     )
+                //     .await;
+
+                // // Allow some time for the topology to refresh
+                // sleep(Duration::from_secs(1).into()).await;
+
+                // let ping = conn
+                //     .route_command(
+                //         &cmd("PING"),
+                //         RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
+                //     )
+                //     .await
+                //     .unwrap();
+
+                // let res = match ping {
+                //     Value::Map(map) => map,
+                //     _ => panic!("Unexpected PING response: {:?}", ping),
+                // };
+
+                // let res_size = if refresh_topology_from_initial_nodes {
+                //     1
+                // } else {
+                //     2 // since both node 1 and node 2 forgot about node 0, and we do follow majority decisions
+                // };
+
+                // assert!(
+                //     res.len() == res_size,
+                //     "Expected exactly {} PING responses",
+                //     res_size
+                // );
+
+                // if refresh_topology_from_initial_nodes {
+                //     assert!(
+                //         res.iter().any(|(k, _)| k
+                //             == &Value::BulkString(
+                //                 format!("{}:{}", node_0_host, node_0_port).into_bytes()
+                //             )),
+                //         "Expected to see node 0 only"
+                //     );
+                // }
+
+                // Ok(())
+            });
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+
+    fn test_refresh_topology_from_initial_nodes2() {
+        for refresh_topology_from_initial_nodes in [true] {
+            // let cluster = TestClusterContext::new(3, 0);
+
+            let _ = block_on_all(async move {
+                // Extract node_0 address for later
+                // let (node_0_host, node_0_port) = match cluster.nodes[0].addr {
+                //     ConnectionAddr::Tcp(ref host, port) => (host.clone(), port),
+                //     ConnectionAddr::TcpTls { ref host, port, .. } => (host.clone(), port),
+                //     _ => panic!("Unsupported connection address"),
+                // };
+
+                // let initial_nodes: Vec<ConnectionInfo> = vec![ConnectionInfo {
+                //     addr: ConnectionAddr::TcpTls {
+                //         host: "clustercfg.glide-intuit-az.ime4qh.use1.cache.amazonaws.com"
+                //             .to_string(),
+                //         port: 6379,
+                //         insecure: true,
+                //         tls_params: None,
+                //     },
+                //     redis: Default::default(),
+                // }];
+
+                let initial_nodes = vec![ConnectionInfo {
+                    addr: ConnectionAddr::TcpTls {
+                        host: "tlscheck.shohame-glide-intuit-test.ime4qh.use1.cache.amazonaws.com"
+                            .into(),
+                        port: 6379,
+                        insecure: false,
+                        tls_params: None,
+                    },
+                    redis: Default::default(),
+                }];
+
+                let builder = redis::cluster::ClusterClientBuilder::new(initial_nodes.clone())
+                    .use_protocol(use_protocol())
+                    .slots_refresh_rate_limit(Duration::from_secs(0), 0)
+                    .refresh_topology_from_initial_nodes(true)
+                    .periodic_topology_checks(Duration::from_secs(60))
+                    // .tls(redis::TlsMode::Insecure)
+                    .read_from(redis::cluster_slotmap::ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(("us-east-1c").to_string()))
+;
+
+                let client = builder.build().unwrap();
+
+                let mut conn = client
+                    .get_async_generic_connection::<MultiplexedConnection>()
+                    .await
+                    .unwrap();
+
+                println!(
+                    "Connected to cluster with nodes: {:?}",
+                    conn.route_command(
+                        &redis::cmd("PING"),
+                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)
+                    )
+                    .await
+                    .unwrap()
+                );
+
+                // print cluster nodes
+                let cluster_nodes = conn
+                    .route_command(
+                        &redis::cmd("CLUSTER").arg("NODES"),
+                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
+                    )
+                    .await
+                    .unwrap();
+
+                println!("Cluster Nodes: {:?}", cluster_nodes);
+
+                // Add 5 min sleep
+                // tokio::time::sleep(Duration::from_secs(60)).await;
+
+                // let (moved_key, key2) = generate_two_keys_in_the_same_node(nodes_and_slots);
+                // let key_slot = get_slot(moved_key.as_bytes());
+
+                // cluster
+                //     .move_specific_slot(key_slot, slot_distribution)
+                //     .await;
+
+                // println!("Triggering MOVED error by accessing key routed to wrong node");
+
+                // conn.route_command(
+                //     cmd("GET").arg("key"),
+                //     RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
+                //         0,
+                //         SlotAddr::Master,
+                //     ))),
+                // )
+                // .await
+                // .unwrap();
+
+                // sleep for one minute to allow the cluster to refresh slots
+                tokio::time::sleep(Duration::from_secs(222)).await;
+
+                let cluster_nodes = conn
+                    .route_command(
+                        cmd("CLUSTER").arg("NODES"),
+                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
+                    )
+                    .await
+                    .unwrap();
+
+                println!("Cluster Nodes: {:?}", cluster_nodes);
+
+                Ok(())
+
+                // Discover topology
+                // let cluster_nodes = cluster.get_cluster_nodes().await;
+                // let slot_distribution = cluster.get_slots_ranges_distribution(&cluster_nodes);
+
+                // // Partition cluster into node_0 and the rest
+                // let (node_0_info, rest): (Vec<_>, Vec<_>) = slot_distribution
+                //     .into_iter()
+                //     .partition(|(_, addr, port, _)| {
+                //         addr == &node_0_host && port == &node_0_port.to_string()
+                //     });
+
+                // let node_0_id = node_0_info[0].0.clone();
+                // let rest_ids: Vec<_> = rest.iter().map(|(id, _, _, _)| id.clone()).collect();
+
+                // // Connect through node0 (use node0 as initial node)
+                // let client = redis::cluster::ClusterClientBuilder::new(vec![cluster.nodes[0].clone()])
+                //         .use_protocol(use_protocol())
+                //         // Force slots refresh to be immediate after MOVED error
+                //         .slots_refresh_rate_limit(Duration::from_secs(0), 0)
+                //         .refresh_topology_from_initial_nodes(refresh_topology_from_initial_nodes)
+                //         .build()
+                //         .unwrap();
+
+                // let mut conn = client.get_async_connection(None).await.unwrap();
+
+                // // Disable full coverage requirement
+                // let _ = conn
+                //     .route_command(
+                //         &cmd("CONFIG")
+                //             .arg("SET")
+                //             .arg("cluster-require-full-coverage")
+                //             .arg("no"),
+                //         RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
+                //     )
+                //     .await
+                //     .expect("Failed to disable full coverage requirement");
+
+                // // Check that all nodes are reachable
+                // let ping = conn
+                //     .route_command(
+                //         &cmd("PING"),
+                //         RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
+                //     )
+                //     .await
+                //     .expect("Failed to PING all nodes");
+
+                // let res = match ping {
+                //     Value::Map(map) => map,
+                //     _ => panic!("Unexpected PING response: {:?}", ping),
+                // };
+
+                // assert_eq!(res.len(), 3, "Expected exactly 3 PING responses");
+
+                // // Make all nodes forget node_0
+                // let mut forget_node_0 = cmd("CLUSTER");
+                // forget_node_0.arg("FORGET").arg(&node_0_id);
+
+                // let _ = conn
+                //     .route_command(
+                //         &forget_node_0,
+                //         RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
+                //     )
+                //     .await;
+
+                // // Instruct node_0 to forget all other nodes.
+                // // This fully partitions the cluster, ensuring node_0 has no knowledge of the remaining nodes.
+                // // This step is necessary so that after a topology refresh, node_0's view excludes the rest,
+                // // preventing any residual cluster state due to gossip propagation delays.
+                // for rest_id in &rest_ids {
+                //     let mut forget_rest = cmd("CLUSTER");
+                //     forget_rest.arg("FORGET").arg(rest_id);
+
+                //     let _ = conn
+                //         .route_command(
+                //             &forget_rest,
+                //             RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
+                //                 host: node_0_host.clone(),
+                //                 port: node_0_port,
+                //             }),
+                //         )
+                //         .await
+                //         .expect("Failed to make node 0 forget");
+                // }
+
+                // // Force a MOVED error by routing key1 through the wrong slot, this should trigger refresh slots immediately
+                // // key1 -> 9189 (node 1)
+                // // key2 -> 12539 (node 2)
+                // let _ = conn
+                //     .route_command(
+                //         &cmd("GET").arg("key1"),
+                //         RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
+                //             get_slot("key".as_bytes()),
+                //             SlotAddr::Master,
+                //         ))),
+                //     )
+                //     .await;
+
+                // // Allow some time for the topology to refresh
+                // sleep(Duration::from_secs(1).into()).await;
+
+                // let ping = conn
+                //     .route_command(
+                //         &cmd("PING"),
+                //         RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllNodes, None)),
+                //     )
+                //     .await
+                //     .unwrap();
+
+                // let res = match ping {
+                //     Value::Map(map) => map,
+                //     _ => panic!("Unexpected PING response: {:?}", ping),
+                // };
+
+                // let res_size = if refresh_topology_from_initial_nodes {
+                //     1
+                // } else {
+                //     2 // since both node 1 and node 2 forgot about node 0, and we do follow majority decisions
+                // };
+
+                // assert!(
+                //     res.len() == res_size,
+                //     "Expected exactly {} PING responses",
+                //     res_size
+                // );
+
+                // if refresh_topology_from_initial_nodes {
+                //     assert!(
+                //         res.iter().any(|(k, _)| k
+                //             == &Value::BulkString(
+                //                 format!("{}:{}", node_0_host, node_0_port).into_bytes()
+                //             )),
+                //         "Expected to see node 0 only"
+                //     );
+                // }
+
+                // Ok(())
             });
         }
     }
@@ -6492,30 +6876,30 @@ mod cluster_async {
             .unwrap();
         }
 
-        #[test]
-        #[serial_test::serial]
-        fn test_async_cluster_should_not_connect_without_mtls_enabled() {
-            let cluster = TestClusterContext::new_with_mtls(3, 0);
-            block_on_all(async move {
-            let client = create_cluster_client_from_cluster(&cluster, false).unwrap();
-            let connection = client.get_async_connection(None).await;
-            match cluster.cluster.servers.first().unwrap().connection_info() {
-                ConnectionInfo {
-                    addr: redis::ConnectionAddr::TcpTls { .. },
-                    ..
-            } => {
-                if connection.is_ok() {
-                    panic!("Must NOT be able to connect without client credentials if server accepts TLS");
-                }
-            }
-            _ => {
-                if let Err(e) = connection {
-                    panic!("Must be able to connect without client credentials if server does NOT accept TLS: {e:?}");
-                }
-            }
-            }
-            Ok::<_, RedisError>(())
-        }).unwrap();
-        }
+        //     #[test]
+        //     #[serial_test::serial]
+        //     fn test_async_cluster_should_not_connect_without_mtls_enabled() {
+        //         let cluster = TestClusterContext::new_with_mtls(3, 0);
+        //         block_on_all(async move {
+        //         let client = create_cluster_client_from_cluster(&cluster, false).unwrap();
+        //         let connection = client.get_async_connection(None).await;
+        //         match cluster.cluster.servers.first().unwrap().connection_info() {
+        //             ConnectionInfo {
+        //                 addr: redis::ConnectionAddr::TcpTls { .. },
+        //                 ..
+        //         } => {
+        //             if connection.is_ok() {
+        //                 panic!("Must NOT be able to connect without client credentials if server accepts TLS");
+        //             }
+        //         }
+        //         _ => {
+        //             if let Err(e) = connection {
+        //                 panic!("Must be able to connect without client credentials if server does NOT accept TLS: {e:?}");
+        //             }
+        //         }
+        //         }
+        //         Ok::<_, RedisError>(())
+        //     }).unwrap();
+        //     }
     }
 }

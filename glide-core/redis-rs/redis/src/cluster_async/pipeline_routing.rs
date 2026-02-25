@@ -584,6 +584,10 @@ fn process_pipeline_responses(
     for ((address, command_indices), response_result) in
         addresses_and_indices.into_iter().zip(responses)
     {
+        println!(
+            "Processing response from node: {} response {response_result:?}",
+            address
+        );
         let (server_error, retry_method) = match response_result {
             Ok(Ok(Response::Multiple(values))) => {
                 // Add each response to the pipeline_responses vector at the appropriate index
@@ -640,6 +644,10 @@ fn process_pipeline_responses(
             // If we received a redis error, we will convert it to a ServerError and append it to the relevant indices
             Ok(Err(err)) => {
                 let retry_method = err.retry_method();
+                println!(
+                    "Pipeline command received server error from node {}: {:?}, retry method: {:?}",
+                    address, err, retry_method
+                );
                 (err.into(), retry_method)
             }
             // If we received a receive (connection) error, we will create a ServerError and append it to the relevant indices.
@@ -724,6 +732,10 @@ fn update_retry_map(
         RetryMethod::RefreshSlotsAndRetry => {
             // TODO: Add support for refreshing slots and retrying in pipelines
             // https://github.com/valkey-io/valkey-glide/issues/5226
+            println!(
+                "Warning: RefreshSlotsAndRetry is not yet supported for pipelines. Skipping retry for command at index {}.",
+                index
+            );
         }
         RetryMethod::RetryImmediately
         | RetryMethod::WaitAndRetry

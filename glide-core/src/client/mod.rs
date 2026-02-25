@@ -268,16 +268,44 @@ async fn run_with_timeout_with_callback<T>(
     timeout: Option<Duration>,
     future: impl futures::Future<Output = RedisResult<T>> + Send,
     callback_id: Option<u32>,
+    entered_send_command_at: std::time::Instant,
 ) -> redis::RedisResult<T> {
-    log_info(
-        "Starting run_with_timeout",
-        format!("callback_id={:?}", callback_id),
-    );
+    let entered_timeout_at = std::time::Instant::now();
+
     match timeout {
         Some(duration) => match tokio::time::timeout(duration, future).await {
-            Ok(result) => result,
+            Ok(result) => {
+                let total = entered_send_command_at.elapsed();
+                if total.as_millis() > 500 {
+                    log_warn(
+                        "send_command_with_callback_id",
+                        format!(
+                            "SLOW COMMAND TIMING | callback_id={:?} | send_cmd_to_timeout={}ms | timeout_to_future_start=<inside> | total={}ms | result={}",
+                            callback_id,
+                            entered_timeout_at
+                                .duration_since(entered_send_command_at)
+                                .as_millis(),
+                            total.as_millis(),
+                            if result.is_ok() { "ok" } else { "err" },
+                        ),
+                    );
+                }
+                result
+            }
             Err(_) => {
-                // Record timeout error metric if telemetry is initialized
+                let total = entered_send_command_at.elapsed();
+                log_warn(
+                    "send_command",
+                    format!(
+                        "TIMEOUT TIMING | callback_id={:?} | send_cmd_to_timeout={}ms | total={}ms | expected={}ms",
+                        callback_id,
+                        entered_timeout_at
+                            .duration_since(entered_send_command_at)
+                            .as_millis(),
+                        total.as_millis(),
+                        duration.as_millis(),
+                    ),
+                );
                 if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
                     log_error(
                         "OpenTelemetry:timeout_error",
@@ -656,9 +684,20 @@ impl Client {
                 Ok(request_timeout) => request_timeout,
                 Err(err) => return Err(err),
             };
+            let entered_at = std::time::Instant::now();
+            let future_entered_at = entered_at.clone();
 
             let result = run_with_timeout_with_callback(request_timeout, async move {
-                log_info( "Starting send_command_with_callback_id", format!("callback_id={:?}", call_back_id));
+                let future_start = std::time::Instant::now();
+        let scheduling_gap = future_start.duration_since(future_entered_at);
+        // This only gets logged if the outer function detects slowness
+        if scheduling_gap.as_millis() > 100 {
+            log_warn(
+                "send_command", format!(
+                "FUTURE START DELAY | callback_id={:?} | gap={}ms",
+                call_back_id, scheduling_gap.as_millis()
+            ));
+        }
                 match client {
                     ClientWrapper::Standalone(mut client) => client.send_command(cmd).await,
                     ClientWrapper::Cluster {mut client } => {
@@ -692,7 +731,7 @@ impl Client {
                     ClientWrapper::Lazy(_) => unreachable!("Lazy client should have been initialized"),
                 }
                 .and_then(|value| convert_to_expected_type(value, expected_type))
-            }, call_back_id)
+            }, call_back_id, entered_at)
             .await?;
 
             // Intercept CLIENT SETNAME commands after regular processing

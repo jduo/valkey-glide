@@ -64,8 +64,8 @@ pub static JVM: std::sync::OnceLock<Arc<JavaVM>> = std::sync::OnceLock::new();
 static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
 
 // Defaults for runtime and callback workers
-const DEFAULT_RUNTIME_WORKER_THREADS: usize = 1;
-const DEFAULT_CALLBACK_WORKER_THREADS: usize = 2;
+const DEFAULT_RUNTIME_WORKER_THREADS: usize = 1; // 2
+const DEFAULT_CALLBACK_WORKER_THREADS: usize = 2; // 4
 
 // =========================
 // Native buffer registry
@@ -121,11 +121,31 @@ pub(crate) fn get_runtime() -> &'static Runtime {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 let metrics = handle.metrics();
+                if(metrics.num_workers() > 1) {
                 log::warn!(
                     "TOKIO METRICS | workers={}",
                     metrics.num_workers(),
                     
                 );
+                }
+            }
+        });
+
+        // Heartbeat monitor - should tick every 100ms
+        // If gaps grow, tokio thread isn't getting CPU
+        runtime.spawn(async {
+            let mut last = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let now = std::time::Instant::now();
+                let gap = now.duration_since(last).as_millis();
+                if gap > 500 {
+                    log::warn!(
+                        "TOKIO HEARTBEAT GAP | expected=100ms | actual={}ms | starvation={}ms",
+                        gap, gap - 100
+                    );
+                }
+                last = now;
             }
         });
 

@@ -26,6 +26,7 @@ dashmap = "6.1.0"
 parking_lot = "0.12"
 scopeguard = "1.2"
 telemetrylib = { path = "../glide-core/telemetry"}
+futures = "0.3.32"
 
 [profile.release]
 opt-level = 3
