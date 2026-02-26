@@ -441,7 +441,7 @@ impl ScanState {
             next_slot,
             &mut scanned_slots_map,
             allow_non_covered_slots,
-        ) {
+        ).await {
             Ok(NextNodeResult::Address(new_address)) => {
                 let new_epoch = core.address_epoch(&new_address).await.unwrap_or(0);
                 Ok(ScanState::new(

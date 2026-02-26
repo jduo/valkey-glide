@@ -498,7 +498,7 @@ where
     /// return slots of node
     pub(crate) async fn slots_of_address(&self, node_address: Arc<String>) -> Vec<u16> {
         self.conn_lock
-            .read()
+            .read().await
             .slot_map
             .get_slots_of_node(node_address)
     }
@@ -509,7 +509,7 @@ where
         address: &str,
     ) -> Option<ConnectionFuture<C>> {
         self.conn_lock
-            .read()
+            .read().await
             .connection_for_address(address)
             .map(|(_, conn)| conn)
     }
@@ -1344,7 +1344,7 @@ where
             };
             inner
                 .conn_lock
-                .write()
+                .write().await
                 .extend_connection_map(connection_map);
             if let Err(err) = Self::refresh_slots_and_subscriptions_with_retries(
                 inner.clone(),
@@ -1475,7 +1475,7 @@ where
         for address in addresses {
             if let Some(existing_task) = inner
                 .conn_lock
-                .read()
+                .read().await
                 .refresh_conn_state
                 .refresh_address_in_progress
                 .get(&address)
@@ -1493,7 +1493,7 @@ where
 
             let mut node_option = inner
                 .conn_lock
-                .read()
+                .write().await
                 .remove_node(&address);
 
             if !check_existing_conn {
@@ -1521,7 +1521,7 @@ where
                 for backoff_duration in infinite_backoff_iter {
                     let mut cluster_params = inner_clone
                         .cluster_params
-                        .read()
+                        .read().await
                         .clone();
                     let subs_guard = inner_clone.subscriptions_by_address.read().await;
                     cluster_params.pubsub_subscriptions =
@@ -1545,7 +1545,7 @@ where
                             if first_attempt {
                                 if let Some(ref mut conn_state) = inner_clone
                                     .conn_lock
-                                    .write()
+                                    .write().await
                                     .refresh_conn_state
                                     .refresh_address_in_progress
                                     .get_mut(&address_clone_for_task)
@@ -1572,7 +1572,7 @@ where
                         );
                         inner_clone
                             .conn_lock
-                            .read()
+                            .write().await
                             .replace_or_add_connection_for_address(&address_clone_for_task, node);
                     }
                     Err(err) => {
@@ -1585,7 +1585,7 @@ where
 
                 inner_clone
                     .conn_lock
-                    .write()
+                    .write().await
                     .refresh_conn_state
                     .refresh_address_in_progress
                     .remove(&address_clone_for_task);
@@ -1604,7 +1604,7 @@ where
 
             inner
                 .conn_lock
-                .write()
+                .write().await
                 .refresh_conn_state
                 .refresh_address_in_progress
                 .insert(address.clone(), refresh_task_state);
@@ -2227,7 +2227,7 @@ where
         if let Ok((_, found_topology_hash)) = topology_result {
             if inner
                 .conn_lock
-                .read()
+                .read().await
                 .get_current_topology_hash()
                 != found_topology_hash
             {
@@ -2405,7 +2405,7 @@ where
     ) -> RedisResult<()> {
         let curr_shard_addrs = inner
             .conn_lock
-            .read()
+            .read().await
             .slot_map
             .shard_addrs_for_slot(slot);
         // let curr_shard_addrs = connections_container.slot_map.shard_addrs_for_slot(slot);
@@ -2841,7 +2841,7 @@ where
                 ..
             } => core
                 .conn_lock
-                .read()
+                .read().await
                 .connection_for_address(moved_addr.as_str())
                 .map_or(
                     ConnectionCheck::OnlyAddress(moved_addr),
@@ -2853,7 +2853,7 @@ where
             } => {
                 asking = should_exec_asking;
                 core.conn_lock
-                    .read()
+                    .read().await
                     .connection_for_address(ask_addr.as_str())
                     .map_or(
                         ConnectionCheck::OnlyAddress(ask_addr),
@@ -2918,7 +2918,7 @@ where
                         // Step 5: Retry the connection lookup after waiting for the reconnect task.
                         if let Some((conn, address)) = core
                             .conn_lock
-                            .read()
+                            .read().await
                             .connection_for_route(&route)
                         {
                             conn_check = ConnectionCheck::Found((conn, address));
@@ -2943,7 +2943,7 @@ where
             InternalSingleNodeRouting::ByAddress(address) => {
                 let conn_option = core
                     .conn_lock
-                    .read()
+                    .read().await
                     .connection_for_address(&address);
                 if let Some((address, conn)) = conn_option {
                     return Ok((address, conn.await));
@@ -2992,7 +2992,7 @@ where
                 // Try fetching the connection after the notifier resolves
                 let conn_option = core
                     .conn_lock
-                    .read()
+                    .read().await
                     .connection_for_address(&address);
 
                 if let Some((address, conn)) = conn_option {
@@ -3010,7 +3010,7 @@ where
             ConnectionCheck::RandomConnection => {
                 let random_conn = core
                     .conn_lock
-                    .read()
+                    .read().await
                     .random_connections(1, ConnectionType::User);
                 let (random_address, random_conn_future) =
                     match random_conn.and_then(|conn_iter| conn_iter.into_iter().next()) {
@@ -3149,7 +3149,7 @@ where
     ) {
         let is_primary = core
             .conn_lock
-            .read()
+            .read().await
             .is_primary(&address);
 
         if !is_primary {
@@ -3696,7 +3696,7 @@ where
         }
     } else if let Some(random_conns) = inner
         .conn_lock
-        .read()
+        .read().await
         .random_connections(num_of_nodes_to_query, ConnectionType::PreferManagement)
     {
         (random_conns, HashSet::new())
