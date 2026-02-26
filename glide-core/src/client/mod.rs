@@ -786,7 +786,7 @@ impl Client {
                 let cluster_cursor_id = if cursor.is_finished() {
                     Value::BulkString(FINISHED_SCAN_CURSOR.into()) // Use constant
                 } else {
-                    Value::BulkString(insert_cluster_scan_cursor(cursor).into())
+                    Value::BulkString(insert_cluster_scan_cursor(cursor).await.into())
                 };
                 Ok(Value::Array(vec![cluster_cursor_id, Value::Array(keys)]))
             }
@@ -1029,7 +1029,7 @@ impl Client {
             return result;
         };
         if err.kind() == ErrorKind::NoScriptError {
-            let Some(code) = get_script(hash) else {
+            let Some(code) = get_script(hash).await else {
                 return Err(err);
             };
             let load = load_cmd(&code);

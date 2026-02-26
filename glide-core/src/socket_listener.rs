@@ -349,7 +349,7 @@ async fn cluster_scan(cluster_scan: ClusterScan, mut client: Client) -> ClientUs
     let cluster_scan_cursor = if cursor.is_empty() {
         ScanStateRC::new()
     } else {
-        get_cluster_scan_cursor(cursor)?
+        get_cluster_scan_cursor(cursor).await?
     };
     let mut cluster_scan_args_builder =
         ClusterScanArgs::builder().allow_non_covered_slots(cluster_scan.allow_non_covered_slots);
