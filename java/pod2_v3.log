@@ -1,0 +1,31 @@
+Starting a Gradle Daemon, 1 busy Daemon could not be reused, use --status for details
+Building Rust with target: 'aarch64-unknown-linux-gnu.2.17'
+> Task :client:generateEffectiveLombokConfig UP-TO-DATE
+> Task :client:protobuf
+> Task :client:compileJava UP-TO-DATE
+> Task :client:processResources NO-SOURCE
+> Task :client:classes UP-TO-DATE
+> Task :client:buildRust FAILED
+
+[Incubating] Problems report is available at: file:///home/ubuntu/glide-for-redis/java/build/reports/problems/problems-report.html
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':client:buildRust'.
+> A problem occurred starting process 'command 'cargo''
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights.
+> Get more help at https://help.gradle.org.
+
+Deprecated Gradle features were used in this build, making it incompatible with Gradle 9.0.
+
+You can use '--warning-mode all' to show the individual deprecation warnings and determine if they come from your own scripts or plugins.
+
+For more on this, please refer to https://docs.gradle.org/8.14.3/userguide/command_line_interface.html#sec:command_line_warnings in the Gradle documentation.
+
+BUILD FAILED in 42s
+4 actionable tasks: 2 executed, 2 up-to-date

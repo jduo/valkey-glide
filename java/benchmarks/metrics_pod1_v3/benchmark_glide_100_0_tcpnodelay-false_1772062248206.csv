@@ -1,0 +1,5 @@
+timestamp,elapsed_hours,interval_success_ops,interval_gets,interval_sets,interval_dels,interval_timeout_errors,interval_other_errors,total_success_ops,total_gets,total_sets,total_dels,total_timeout_errors,total_other_errors,timeout_rate_percent,interval_tps,avg_latency_ms,min_latency_ms,p50_latency_ms,p90_latency_ms,p99_latency_ms,p999_latency_ms,max_latency_ms
+2026-02-25 23:31:48,0.0167,1035784,0,0,1035784,0,0,1035784,0,0,1035784,0,0,0.0000,17263.1,3.472,0.544,3.252,4.339,6.543,30.514,44.633
+2026-02-25 23:32:48,0.0333,1038176,0,0,1038176,0,0,2073960,0,0,2073960,0,0,0.0000,17302.9,3.465,0.533,3.227,4.305,6.050,34.273,47.527
+2026-02-25 23:33:48,0.0500,1068008,0,0,1068008,0,0,3141968,0,0,3141968,0,0,0.0000,17800.1,3.369,0.637,3.159,4.216,5.798,30.672,39.730
+2026-02-25 23:34:48,0.0667,1035851,0,0,1035851,0,0,4177819,0,0,4177819,0,0,0.0000,17264.2,3.473,0.539,3.247,4.322,5.908,31.933,41.151

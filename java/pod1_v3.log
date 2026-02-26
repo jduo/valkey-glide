@@ -1,0 +1,201 @@
+Building Rust with target: 'aarch64-unknown-linux-gnu.2.17'
+> Task :client:generateEffectiveLombokConfig UP-TO-DATE
+> Task :client:protobuf
+> Task :client:compileJava UP-TO-DATE
+> Task :client:processResources NO-SOURCE
+> Task :client:classes UP-TO-DATE
+
+> Task :client:buildRust
+[1m[33mwarning[0m[1m: unused import: `sleep`[0m
+  [1m[94m--> [0m/home/ubuntu/glide-for-redis/glide-core/src/client/mod.rs:25:25
+   [1m[94m|[0m
+[1m[94m25[0m [1m[94m|[0m use std::thread::{self, sleep};
+   [1m[94m|[0m                         [1m[33m^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m: `glide-core` (lib) generated 1 warning (run `cargo fix --lib -p glide-core` to apply 1 suggestion)
+[1m[33mwarning[0m[1m: unnecessary parentheses around `if` condition[0m
+   [1m[94m--> [0msrc/jni_client.rs:124:19
+    [1m[94m|[0m
+[1m[94m124[0m [1m[94m|[0m                 if(metrics.num_workers() > 1) {
+    [1m[94m|[0m                   [1m[33m^[0m                         [1m[33m^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+[1m[96mhelp[0m: remove these parentheses
+    [1m[94m|[0m
+[1m[94m124[0m [91m- [0m                if[91m([0mmetrics.num_workers() > 1[91m)[0m {
+[1m[94m124[0m [92m+ [0m                if[92m [0mmetrics.num_workers() > 1 {
+    [1m[94m|[0m
+
+[1m[33mwarning[0m: `glide-rs` (lib) generated 1 warning (run `cargo fix --lib -p glide-rs` to apply 1 suggestion)
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.19s
+
+> Task :client:copyNativeLib UP-TO-DATE
+> Task :client:generateTestEffectiveLombokConfig UP-TO-DATE
+> Task :client:compileTestJava UP-TO-DATE
+> Task :client:shadowJar UP-TO-DATE
+> Task :client:generateMetadataFileForMavenJavaPublication
+> Task :client:generatePomFileForMavenJavaPublication
+> Task :client:delombok UP-TO-DATE
+> Task :client:javadoc UP-TO-DATE
+> Task :client:javadocJar UP-TO-DATE
+> Task :client:sourcesJar UP-TO-DATE
+> Task :client:signMavenJavaPublication SKIPPED
+> Task :client:publishMavenJavaPublicationToMavenLocal
+> Task :client:publishToMavenLocal
+> Task :benchmarks:compileJava UP-TO-DATE
+> Task :benchmarks:processResources NO-SOURCE
+> Task :benchmarks:classes UP-TO-DATE
+
+> Task :benchmarks:run
+Valkey-GLIDE async client
+[2m2026-02-25T23:28:57.360644Z[0m [32m INFO[0m [2mlogger_core[0m[2m:[0m Connection configuration - 
+Addresses: clustercfg.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379
+TLS mode: Insecure
+Cluster mode
+Request timeout: 1000
+Connection timeout: 2000
+Read from Replica mode: Only primary
+database ID: 0
+Protocol: RESP3
+Periodic Checks: Enabled with manual interval of 600s
+
+Inflight requests limit: {}: 1000
+[2m2026-02-25T23:28:57.361718Z[0m [34mDEBUG[0m [2mredis::retry_strategies[0m[2m:[0m Starting RetryStrategy with values: RetryStrategy { factor: 100, exponent_base: 2, number_of_retries: 5, jitter_percent: 20 }
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+Pipeline response received: ok
+[2m2026-02-25T23:28:57.553141Z[0m [32m INFO[0m [2mredis::cluster_async[0m[2m:[0m Connected to initial nodes:
+172.31.52.117:6379 - 172.31.52.117
+172.31.71.210:6379 - 172.31.71.210
+172.31.19.100:6379 - 172.31.19.100
+172.31.61.40:6379 - 172.31.61.40
+172.31.39.124:6379 - 172.31.39.124
+172.31.3.14:6379 - 172.31.3.14
+172.31.18.163:6379 - 172.31.18.163
+172.31.83.241:6379 - 172.31.83.241
+172.31.69.7:6379 - 172.31.69.7
+
+[2m2026-02-25T23:28:57.556034Z[0m [32m INFO[0m [2mredis::cluster_topology[0m[2m:[0m calculate_topology found topology map:
+TopologyView { hash_value: 7421406585921931376, nodes_count: 9, slots_and_count: (16384, [Slot { start: 0, end: 5461, master: "valkey-cache-jd-0001-001.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379", replicas: ["valkey-cache-jd-0001-002.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379", "valkey-cache-jd-0001-003.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379"] }, Slot { start: 5462, end: 10922, master: "valkey-cache-jd-0002-001.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379", replicas: ["valkey-cache-jd-0002-002.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379", "valkey-cache-jd-0002-003.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379"] }, Slot { start: 10923, end: 16383, master: "valkey-cache-jd-0003-001.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379", replicas: ["valkey-cache-jd-0003-002.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379", "valkey-cache-jd-0003-003.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379"] }]), address_to_ip_map: {"valkey-cache-jd-0003-001.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379": 172.31.39.124, "valkey-cache-jd-0002-001.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379": 172.31.3.14, "valkey-cache-jd-0003-002.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379": 172.31.83.241, "valkey-cache-jd-0003-003.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379": 172.31.71.210, "valkey-cache-jd-0001-003.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379": 172.31.52.117, "valkey-cache-jd-0001-002.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379": 172.31.19.100, "valkey-cache-jd-0001-001.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379": 172.31.69.7, "valkey-cache-jd-0002-003.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379": 172.31.61.40, "valkey-cache-jd-0002-002.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379": 172.31.18.163} }
+[2m2026-02-25T23:28:57.586518Z[0m [32m INFO[0m [2mredis::cluster_async[0m[2m:[0m refresh_slots found nodes:
+valkey-cache-jd-0001-002.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379 - 172.31.19.100
+valkey-cache-jd-0002-001.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379 - 172.31.3.14
+valkey-cache-jd-0001-001.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379 - 172.31.69.7
+valkey-cache-jd-0002-003.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379 - 172.31.61.40
+valkey-cache-jd-0003-001.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379 - 172.31.39.124
+valkey-cache-jd-0002-002.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379 - 172.31.18.163
+valkey-cache-jd-0003-003.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379 - 172.31.71.210
+valkey-cache-jd-0001-003.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379 - 172.31.52.117
+valkey-cache-jd-0003-002.valkey-cache-jd.nra7gl.use1.cache.amazonaws.com:6379 - 172.31.83.241
+
+[2m2026-02-25T23:28:57.586549Z[0m [34mDEBUG[0m [2mredis::cluster_async::connections_container[0m[2m:[0m clear_refresh_state: removing all in-progress refresh connection tasks for addresses: []
+
+===== Warmup Phase =====
+Pre-populating 100000 keys (2KB each) with 100 byte values...
+[2026-02-25 23:29:17.141] ASYNC REGISTRY | pending=1 | registered=8565 | completed=8564 | errors=0
+Warmup progress: 10,000/100,000 keys (10.0%)
+[2026-02-25 23:29:27.059] ASYNC REGISTRY | pending=1 | registered=12869 | completed=12868 | errors=0
+[2026-02-25 23:29:37.060] ASYNC REGISTRY | pending=1 | registered=18545 | completed=18544 | errors=0
+Warmup progress: 20,000/100,000 keys (20.0%)
+[2026-02-25 23:29:47.059] ASYNC REGISTRY | pending=1 | registered=23447 | completed=23446 | errors=0
+Warmup progress: 30,000/100,000 keys (30.0%)
+[2026-02-25 23:29:57.059] ASYNC REGISTRY | pending=1 | registered=35667 | completed=35666 | errors=0
+Warmup progress: 40,000/100,000 keys (40.0%)
+[2026-02-25 23:30:07.059] ASYNC REGISTRY | pending=1 | registered=48168 | completed=48167 | errors=0
+Warmup progress: 50,000/100,000 keys (50.0%)
+Warmup progress: 60,000/100,000 keys (60.0%)
+[2026-02-25 23:30:17.059] ASYNC REGISTRY | pending=1 | registered=60742 | completed=60741 | errors=0
+Warmup progress: 70,000/100,000 keys (70.0%)
+[2026-02-25 23:30:27.059] ASYNC REGISTRY | pending=1 | registered=73368 | completed=73367 | errors=0
+Warmup progress: 80,000/100,000 keys (80.0%)
+[2026-02-25 23:30:37.059] ASYNC REGISTRY | pending=1 | registered=85959 | completed=85958 | errors=0
+Warmup progress: 90,000/100,000 keys (90.0%)
+[2026-02-25 23:30:47.059] ASYNC REGISTRY | pending=1 | registered=98564 | completed=98563 | errors=0
+Warmup progress: 100,000/100,000 keys (100.0%)
+Warmup complete: 100000 keys in 110.61 seconds (904 keys/sec)
+
+ =====> glide <===== 1 clients 60 concurrent 100 data size 
+
+
+============================================================
+BENCHMARK CONFIGURATION
+============================================================
+Start time:        2026-02-25 23:30:48
+Client:            glide
+Clients:           1
+Concurrent tasks:  60
+Data size:         100 bytes
+Key size:          2000 bytes
+Operation type:    delete
+TCP_NODELAY:       false
+Duration:          18000 seconds (5.0 hours)
+Metrics interval:  60 seconds
+Metrics dir:       ./metrics_pod1_v3
+============================================================
+
+Metrics CSV file: ./metrics_pod1_v3/benchmark_glide_100_0_tcpnodelay-false_1772062248206.csv
+Metrics collection started (every 60 seconds)
+[2026-02-25 23:30:57.059] ASYNC REGISTRY | pending=60 | registered=243580 | completed=243520 | errors=0
+[2026-02-25 23:31:07.059] ASYNC REGISTRY | pending=60 | registered=415612 | completed=415552 | errors=0
+[2026-02-25 23:31:17.059] ASYNC REGISTRY | pending=46 | registered=588682 | completed=588636 | errors=0
+[2026-02-25 23:31:27.059] ASYNC REGISTRY | pending=60 | registered=762775 | completed=762715 | errors=0
+[2026-02-25 23:31:37.059] ASYNC REGISTRY | pending=60 | registered=934930 | completed=934870 | errors=0
+[2026-02-25 23:31:47.059] ASYNC REGISTRY | pending=60 | registered=1116194 | completed=1116134 | errors=0
+[2026-02-25 23:31:48] 0.02h | TPS: 17263 | Success: 1,035,784 (GET: 0, SET: 0, DEL: 1035784) | Timeouts: 0 (total: 0) | Other Errors: 0 (total: 0) | P50: 3.3ms | P99: 6.5ms | Max: 44.6ms
+[2026-02-25 23:31:57.059] ASYNC REGISTRY | pending=60 | registered=1283210 | completed=1283150 | errors=0
+[2026-02-25 23:32:07.059] ASYNC REGISTRY | pending=60 | registered=1458761 | completed=1458701 | errors=0
+[2026-02-25 23:32:17.059] ASYNC REGISTRY | pending=60 | registered=1632873 | completed=1632813 | errors=0
+[2026-02-25 23:32:27.059] ASYNC REGISTRY | pending=60 | registered=1806800 | completed=1806740 | errors=0
+[2026-02-25 23:32:37.059] ASYNC REGISTRY | pending=56 | registered=1981341 | completed=1981285 | errors=0
+[2026-02-25 23:32:47.059] ASYNC REGISTRY | pending=60 | registered=2154480 | completed=2154420 | errors=0
+[2026-02-25 23:32:48] 0.03h | TPS: 17303 | Success: 2,073,960 (GET: 0, SET: 0, DEL: 1038176) | Timeouts: 0 (total: 0) | Other Errors: 0 (total: 0) | P50: 3.2ms | P99: 6.1ms | Max: 47.5ms
+[2026-02-25 23:32:57.059] ASYNC REGISTRY | pending=60 | registered=2329116 | completed=2329056 | errors=0
+[2026-02-25 23:33:07.059] ASYNC REGISTRY | pending=60 | registered=2507376 | completed=2507316 | errors=0
+[2026-02-25 23:33:17.059] ASYNC REGISTRY | pending=60 | registered=2681041 | completed=2680981 | errors=0
+[2026-02-25 23:33:27.059] ASYNC REGISTRY | pending=60 | registered=2861451 | completed=2861391 | errors=0
+[2026-02-25 23:33:37.059] ASYNC REGISTRY | pending=60 | registered=3043517 | completed=3043457 | errors=0
+[2026-02-25 23:33:47.059] ASYNC REGISTRY | pending=60 | registered=3221222 | completed=3221162 | errors=0
+[2026-02-25 23:33:48] 0.05h | TPS: 17800 | Success: 3,141,968 (GET: 0, SET: 0, DEL: 1068008) | Timeouts: 0 (total: 0) | Other Errors: 0 (total: 0) | P50: 3.2ms | P99: 5.8ms | Max: 39.7ms
+[2026-02-25 23:33:57.059] ASYNC REGISTRY | pending=60 | registered=3390743 | completed=3390683 | errors=0
+[2026-02-25 23:34:07.059] ASYNC REGISTRY | pending=60 | registered=3563266 | completed=3563206 | errors=0
+[2026-02-25 23:34:17.059] ASYNC REGISTRY | pending=60 | registered=3737051 | completed=3736991 | errors=0
+[2026-02-25 23:34:27.059] ASYNC REGISTRY | pending=60 | registered=3909789 | completed=3909729 | errors=0
+[2026-02-25 23:34:37.059] ASYNC REGISTRY | pending=60 | registered=4086305 | completed=4086245 | errors=0
+[2026-02-25 23:34:47.059] ASYNC REGISTRY | pending=60 | registered=4258086 | completed=4258026 | errors=0
+[2026-02-25 23:34:48] 0.07h | TPS: 17264 | Success: 4,177,819 (GET: 0, SET: 0, DEL: 1035851) | Timeouts: 0 (total: 0) | Other Errors: 0 (total: 0) | P50: 3.2ms | P99: 5.9ms | Max: 41.2ms
+[2026-02-25 23:34:57.059] ASYNC REGISTRY | pending=60 | registered=4426606 | completed=4426546 | errors=0

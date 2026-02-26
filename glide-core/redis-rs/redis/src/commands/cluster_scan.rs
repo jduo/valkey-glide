@@ -555,7 +555,6 @@ where
         if let Some(addr) = core
             .conn_lock
             .read()
-            .expect(MUTEX_READ_ERR)
             .slot_map
             .node_address_for_slot(slot, SlotAddr::ReplicaRequired)
         {

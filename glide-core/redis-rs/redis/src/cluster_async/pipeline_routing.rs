@@ -201,7 +201,7 @@ where
                     match multi_node_routing {
                         MultipleNodeRoutingInfo::AllNodes | MultipleNodeRoutingInfo::AllMasters => {
                             let connections: Vec<_> = {
-                                let lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
+                                let lock = core.conn_lock.read();
                                 if matches!(multi_node_routing, MultipleNodeRoutingInfo::AllNodes) {
                                     lock.all_node_connections().collect()
                                 } else {
@@ -324,7 +324,7 @@ where
     // inner_index is used to keep track of the index of the sub-commands in the multi slot routing info vector.
     for (inner_index, (route, indices)) in slots.iter().enumerate() {
         let conn = {
-            let lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
+            let lock = core.conn_lock.read();
             lock.connection_for_route(route)
         };
         if let Some((address, conn)) = conn {
@@ -780,8 +780,7 @@ where
 {
     // TODO: add support for user-defined retry configurations
     let retry_params = core
-        .get_cluster_param(|params| params.retry_params.clone())
-        .expect(MUTEX_READ_ERR);
+        .get_cluster_param(|params| params.retry_params.clone());
 
     let mut retry = 0;
 
@@ -1009,8 +1008,7 @@ where
     C: Clone + Sync + ConnectionLike + Send + Connect + 'static,
 {
     let retry_params = core
-        .get_cluster_param(|params| params.retry_params.clone())
-        .expect(MUTEX_READ_ERR);
+        .get_cluster_param(|params| params.retry_params.clone());
 
     if matches!(retry_method, RetryMethod::WaitAndRetry) {
         let sleep_duration = retry_params.wait_time_for_retry(retry);
