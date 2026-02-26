@@ -390,11 +390,10 @@ where
     let (receivers, pending_requests, addresses_and_indices) =
         collect_pipeline_requests(pipeline_map, retry, pipeline_retry_strategy);
 
-    // Add the pending requests to the pending_requests queue
-    core.pending_requests
-        .lock()
-        .unwrap()
-        .extend(pending_requests.into_iter());
+    // Add the pending requests to the pending_requests channel
+    for request in pending_requests {
+        let _ = core.pending_requests_tx.send(request);
+    }
 
     // Wait for all receivers to complete and collect the responses
     let responses: Vec<_> = futures::future::join_all(receivers.into_iter())

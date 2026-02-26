@@ -428,7 +428,8 @@ type ConnectionsContainer<C> =
 pub(crate) struct InnerCore<C> {
     pub(crate) conn_lock: StdRwLock<ConnectionsContainer<C>>,
     cluster_params: StdRwLock<ClusterParams>,
-    pending_requests: Mutex<Vec<PendingRequest<C>>>,
+    pending_requests_tx: mpsc::UnboundedSender<PendingRequest<C>>,
+    pending_requests_rx: std::sync::Mutex<mpsc::UnboundedReceiver<PendingRequest<C>>>,
     slot_refresh_state: SlotRefreshState,
     initial_nodes: Vec<ConnectionInfo>,
     subscriptions_by_address: TokioRwLock<HashMap<String, PubSubSubscriptionInfo>>,
@@ -1167,6 +1168,7 @@ where
 
         let topology_checks_interval = cluster_params.topology_checks_interval;
         let slots_refresh_rate_limiter = cluster_params.slots_refresh_rate_limit;
+        let (pending_tx, pending_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(InnerCore {
             conn_lock: StdRwLock::new(ConnectionsContainer::new(
                 Default::default(),
@@ -1175,7 +1177,8 @@ where
                 0,
             )),
             cluster_params: StdRwLock::new(cluster_params.clone()),
-            pending_requests: Mutex::new(Vec::new()),
+            pending_requests_tx: pending_tx,
+            pending_requests_rx: std::sync::Mutex::new(pending_rx),
             slot_refresh_state: SlotRefreshState::new(slots_refresh_rate_limiter),
             initial_nodes: initial_nodes.to_vec(),
             unassigned_subscriptions: TokioRwLock::new(
@@ -2579,10 +2582,9 @@ where
                 }
             };
         }
-        core.pending_requests
-            .lock()
-            .unwrap()
-            .extend(requests.into_iter().flatten());
+        for request in requests.into_iter().flatten() {
+            let _ = core.pending_requests_tx.send(request);
+        }
 
         Self::aggregate_results(receivers, routing, response_policy)
             .await
@@ -3213,9 +3215,16 @@ where
             .get_cluster_param(|params| params.retry_params.clone())
             .expect(MUTEX_READ_ERR);
         let mut poll_flush_action = PollFlushAction::None;
-        let mut pending_requests_guard = self.inner.pending_requests.lock().unwrap();
-        if !pending_requests_guard.is_empty() {
-            let mut pending_requests = mem::take(&mut *pending_requests_guard);
+        
+        // Drain all pending requests from channel
+        let mut pending_requests = Vec::new();
+        let mut rx_guard = self.inner.pending_requests_rx.lock().unwrap();
+        while let Ok(request) = rx_guard.try_recv() {
+            pending_requests.push(request);
+        }
+        drop(rx_guard);
+        
+        if !pending_requests.is_empty() {
             for request in pending_requests.drain(..) {
                 // Drop the request if none is waiting for a response to free up resources for
                 // requests callers care about (load shedding). It will be ambiguous whether the
@@ -3231,9 +3240,7 @@ where
                     future: RequestState::Future { future },
                 }));
             }
-            *pending_requests_guard = pending_requests;
         }
-        drop(pending_requests_guard);
 
         loop {
             let retry_params = retry_params.clone();
@@ -3314,14 +3321,14 @@ where
                     poll_flush_action = poll_flush_action
                         .change_state(PollFlushAction::Reconnect(HashSet::from_iter([target])));
                     if let Some(request) = request {
-                        self.inner.pending_requests.lock().unwrap().push(request);
+                        let _ = self.inner.pending_requests_tx.send(request);
                     }
                 }
                 Next::ReconnectToInitialNodes { request } => {
                     poll_flush_action = poll_flush_action
                         .change_state(PollFlushAction::ReconnectFromInitialConnections);
                     if let Some(request) = request {
-                        self.inner.pending_requests.lock().unwrap().push(request);
+                        let _ = self.inner.pending_requests_tx.send(request);
                     }
                 }
             }
@@ -3347,8 +3354,12 @@ where
                 (*request)
                     .as_mut()
                     .respond(Err(self.refresh_error.take().unwrap()));
-            } else if let Some(request) = self.inner.pending_requests.lock().unwrap().pop() {
-                let _ = request.sender.send(Err(self.refresh_error.take().unwrap()));
+            } else {
+                // Try to get one request from channel to send error
+                let mut rx_guard = self.inner.pending_requests_rx.lock().unwrap();
+                if let Ok(request) = rx_guard.try_recv() {
+                    let _ = request.sender.send(Err(self.refresh_error.take().unwrap()));
+                }
             }
         }
     }
@@ -3398,13 +3409,10 @@ where
 
         let info = RequestInfo { cmd };
 
-        self.inner
-            .pending_requests
-            .lock()
-            .unwrap()
-            .push(PendingRequest {
-                retry: 0,
-                sender,
+        // Send through channel - never blocks!
+        let _ = self.inner.pending_requests_tx.send(PendingRequest {
+            retry: 0,
+            sender,
                 info,
             });
         Ok(())
