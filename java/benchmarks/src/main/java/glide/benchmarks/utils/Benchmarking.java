@@ -1,17 +1,16 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.benchmarks.utils;
-import java.util.Arrays;
+
 import com.google.common.util.concurrent.RateLimiter;
 import glide.benchmarks.BenchmarkingApp.RunConfiguration;
 import glide.benchmarks.clients.AsyncClient;
 import glide.benchmarks.clients.Client;
 import glide.benchmarks.clients.SyncClient;
 import java.io.File;
-import java.util.stream.Collectors;
-import java.util.concurrent.Future;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
@@ -20,11 +19,13 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import org.apache.commons.lang3.tuple.Pair;
 
 /** Class to calculate latency on client-actions */
@@ -49,7 +50,7 @@ public class Benchmarking {
             case WRITE_ONLY:
                 // Only SET operations
                 return ChosenAction.SET;
-            
+
             case DELETE_ONLY:
                 // Only DEL operations
                 return ChosenAction.DEL;
@@ -347,7 +348,8 @@ public class Benchmarking {
                     var clientName = clients.get(0).getName();
 
                     // ========== ADD WARMUP FOR READ-ONLY BENCHMARKS ==========
-                    if (config.operationType == OperationType.READ_ONLY || config.operationType == OperationType.DELETE_ONLY) {
+                    if (config.operationType == OperationType.READ_ONLY
+                            || config.operationType == OperationType.DELETE_ONLY) {
                         System.out.printf("%n===== Warmup Phase =====%n");
                         warmupData(clients, dataSize, config.warmupKeyCount, async, config.debugLogging);
                     }
@@ -459,10 +461,14 @@ public class Benchmarking {
                     // Map to save latency results separately for each action
                     Map<ChosenAction, List<Long>> actionResults =
                             Map.of(
-                                    ChosenAction.GET_EXISTING, new ArrayList<>(),
-                                    ChosenAction.GET_NON_EXISTING, new ArrayList<>(),
-                                    ChosenAction.SET, new ArrayList<>(),
-                                     ChosenAction.DEL, new ArrayList<>());
+                                    ChosenAction.GET_EXISTING,
+                                    new ArrayList<>(),
+                                    ChosenAction.GET_NON_EXISTING,
+                                    new ArrayList<>(),
+                                    ChosenAction.SET,
+                                    new ArrayList<>(),
+                                    ChosenAction.DEL,
+                                    new ArrayList<>());
 
                     // for each task, call future.get() to retrieve & save the result in the map
                     asyncTasks.forEach(
@@ -610,9 +616,10 @@ public class Benchmarking {
                                 for (int i = 0; i < 3; i++) {
                                     keys[i] = generateKeyForRead();
                                 }
-                                String keysSummary = Arrays.stream(keys)
-                                        .map(k -> k.substring(0, Math.min(10, k.length())) + "...")
-                                        .collect(Collectors.joining(", ", "[", "]"));
+                                String keysSummary =
+                                        Arrays.stream(keys)
+                                                .map(k -> k.substring(0, Math.min(10, k.length())) + "...")
+                                                .collect(Collectors.joining(", ", "[", "]"));
                                 DateTimeFormatter ts = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
                                 String thread = Thread.currentThread().getName();
                                 long startMs = System.currentTimeMillis();
@@ -625,25 +632,18 @@ public class Benchmarking {
                                     } catch (java.util.concurrent.TimeoutException e) {
                                         System.err.printf(
                                                 "[%s] !!! DEL STUCK after 3s | thread=%s | keys=%s%n",
-                                                LocalDateTime.now().format(ts),
-                                                thread,
-                                                keysSummary);
+                                                LocalDateTime.now().format(ts), thread, keysSummary);
                                         try {
                                             future.get(30, TimeUnit.SECONDS);
                                             long totalMs = System.currentTimeMillis() - startMs;
                                             System.err.printf(
                                                     "[%s] !!! DEL UNSTUCK after %dms | thread=%s%n",
-                                                    LocalDateTime.now().format(ts),
-                                                    totalMs,
-                                                    thread);
+                                                    LocalDateTime.now().format(ts), totalMs, thread);
                                         } catch (java.util.concurrent.TimeoutException e2) {
                                             long totalMs = System.currentTimeMillis() - startMs;
                                             System.err.printf(
                                                     "[%s] !!! DEL NEVER COMPLETED after %dms | thread=%s | keys=%s%n",
-                                                    LocalDateTime.now().format(ts),
-                                                    totalMs,
-                                                    thread,
-                                                    keysSummary);
+                                                    LocalDateTime.now().format(ts), totalMs, thread, keysSummary);
                                             throw new RuntimeException("DEL future never completed", e2);
                                         } catch (ExecutionException e3) {
                                             long totalMs = System.currentTimeMillis() - startMs;
@@ -660,9 +660,9 @@ public class Benchmarking {
                                     activeDelCount.decrementAndGet();
                                     long elapsed = System.currentTimeMillis() - startMs;
                                     if (elapsed > 2000) {
-                                        System.err.printf("[%s] [SLOW DEL] took %dms | keys=%s%n",
-                                                LocalDateTime.now().format(ts),
-                                                elapsed, keysSummary);
+                                        System.err.printf(
+                                                "[%s] [SLOW DEL] took %dms | keys=%s%n",
+                                                LocalDateTime.now().format(ts), elapsed, keysSummary);
                                     }
                                 }
                             } else {

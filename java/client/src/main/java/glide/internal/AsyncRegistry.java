@@ -53,10 +53,12 @@ public final class AsyncRegistry {
     private static final AtomicLong totalRegistered = new AtomicLong(0);
     private static final AtomicLong totalCompleted = new AtomicLong(0);
     private static final AtomicLong totalErrors = new AtomicLong(0);
-    private static final DateTimeFormatter ts = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+    private static final DateTimeFormatter ts =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
 
     // Track registration time per correlationId to detect stuck futures
     private static final ConcurrentHashMap<Long, Long> registrationTimes = new ConcurrentHashMap<>();
+
     // ==================== END MONITORING ====================
 
     /** Thread-safe ID generator for correlation IDs. */
@@ -76,11 +78,12 @@ public final class AsyncRegistry {
 
     /** Monitoring scheduler for tracking stuck futures */
     private static final ScheduledExecutorService monitor =
-            Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "AsyncRegistry-Monitor");
-                t.setDaemon(true);
-                return t;
-            });
+            Executors.newSingleThreadScheduledExecutor(
+                    r -> {
+                        Thread t = new Thread(r, "AsyncRegistry-Monitor");
+                        t.setDaemon(true);
+                        return t;
+                    });
 
     private static final Thread shutdownHook =
             new Thread(AsyncRegistry::shutdown, "AsyncRegistry-Shutdown");
@@ -105,14 +108,15 @@ public final class AsyncRegistry {
 
             // Check for stuck futures (registered more than 5 seconds ago)
             long now = System.currentTimeMillis();
-            registrationTimes.forEach((id, regTime) -> {
-                long age = now - regTime;
-                if (age > 5000) {
-                    System.err.printf(
-                            "[%s] STUCK FUTURE | correlationId=%d | stuck for %dms%n",
-                            LocalDateTime.now().format(ts), id, age);
-                }
-            });
+            registrationTimes.forEach(
+                    (id, regTime) -> {
+                        long age = now - regTime;
+                        if (age > 5000) {
+                            System.err.printf(
+                                    "[%s] STUCK FUTURE | correlationId=%d | stuck for %dms%n",
+                                    LocalDateTime.now().format(ts), id, age);
+                        }
+                    });
         }
     }
 
@@ -232,7 +236,7 @@ public final class AsyncRegistry {
                 (result, error) -> {
                     // Atomic cleanup - no race conditions
                     activeFutures.remove(correlationId);
-                    
+
                     // Track completion for monitoring
                     registrationTimes.remove(correlationId);
                     if (error != null) {

@@ -2,8 +2,8 @@
 package glide.benchmarks;
 
 import static glide.benchmarks.utils.Benchmarking.testClientSetGet;
-import glide.api.logging.Logger;
 
+import glide.api.logging.Logger;
 import glide.benchmarks.clients.glide.GlideAsyncClient;
 import glide.benchmarks.clients.jedis.JedisClient;
 import glide.benchmarks.clients.lettuce.LettuceAsyncClient;

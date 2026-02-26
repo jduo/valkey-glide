@@ -2319,9 +2319,9 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeClusterScanA
                             redis::ScanStateRC::new()
                         } else {
                             // Get existing cursor from container
-                            match glide_core::cluster_scan_container::get_cluster_scan_cursor(
+                            match glide_core::cluster_scan_container::get_cluster_scan_cursor_async(
                                 cursor_str,
-                            ) {
+                            ).await {
                                 Ok(cursor) => cursor,
                                 Err(e) => {
                                     complete_callback(

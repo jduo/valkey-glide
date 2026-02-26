@@ -2,8 +2,8 @@
 
 mod types;
 
-use crate::cluster_scan_container::insert_cluster_scan_cursor;
-use crate::scripts_container::get_script;
+use crate::cluster_scan_container::insert_cluster_scan_cursor_async;
+use crate::scripts_container::get_script_async;
 use futures::FutureExt;
 use logger_core::{log_debug, log_error, log_info, log_warn};
 use once_cell::sync::OnceCell;
@@ -786,7 +786,7 @@ impl Client {
                 let cluster_cursor_id = if cursor.is_finished() {
                     Value::BulkString(FINISHED_SCAN_CURSOR.into()) // Use constant
                 } else {
-                    Value::BulkString(insert_cluster_scan_cursor(cursor).into())
+                    Value::BulkString(insert_cluster_scan_cursor_async(cursor).await.into())
                 };
                 Ok(Value::Array(vec![cluster_cursor_id, Value::Array(keys)]))
             }
@@ -1029,7 +1029,7 @@ impl Client {
             return result;
         };
         if err.kind() == ErrorKind::NoScriptError {
-            let Some(code) = get_script(hash) else {
+            let Some(code) = get_script_async(hash).await else {
                 return Err(err);
             };
             let load = load_cmd(&code);
