@@ -118,6 +118,11 @@ public final class AsyncRegistry {
                         }
                     });
         }
+        
+        // Cleanup stale entries from registrationTimes to prevent memory leak
+        // Remove entries older than 60 seconds (they should have completed by now)
+        long now = System.currentTimeMillis();
+        registrationTimes.entrySet().removeIf(entry -> (now - entry.getValue()) > 60000);
     }
 
     /** Estimate initial capacity for the active futures map using inflight limit with margin. */
@@ -237,8 +242,8 @@ public final class AsyncRegistry {
                     // Atomic cleanup - no race conditions
                     activeFutures.remove(correlationId);
 
-                    // Track completion for monitoring
-                    registrationTimes.remove(correlationId);
+                    // Track completion for monitoring - MUST remove even on error
+                    Long removedTime = registrationTimes.remove(correlationId);
                     if (error != null) {
                         totalErrors.incrementAndGet();
                     }

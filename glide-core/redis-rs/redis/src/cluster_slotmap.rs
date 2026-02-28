@@ -14,7 +14,7 @@ use crate::RedisResult;
 /// Maps node addresses to their IP address and shard information.
 pub(crate) type NodesMap = DashMap<Arc<String>, (Option<IpAddr>, Arc<ShardAddrs>)>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SlotMapValue {
     pub(crate) start: u16,
     pub(crate) addrs: Arc<ShardAddrs>,
@@ -38,7 +38,7 @@ pub enum ReadFromReplicaStrategy {
     AZAffinityReplicasAndPrimary(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct SlotMap {
     pub(crate) slots: BTreeMap<u16, SlotMapValue>,
     nodes_map: NodesMap,

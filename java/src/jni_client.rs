@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use redis::{RedisError as ServerError, Value as ServerValue};
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::channel;
 use std::thread;
 use tokio::runtime::Runtime;
 
@@ -137,7 +137,7 @@ pub(crate) fn get_runtime() -> &'static Runtime {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 let metrics = handle.metrics();
-                if(metrics.num_workers() > 1) {
+                if metrics.num_workers() > 1 {
                 log::warn!(
                     "TOKIO METRICS | workers={}",
                     metrics.num_workers(),
@@ -385,8 +385,8 @@ pub(crate) fn get_method_cache(env: &mut JNIEnv) -> Result<MethodCache> {
 /// Callback job type handled by dedicated callback workers
 type CallbackJob = (Arc<JavaVM>, jlong, CallbackResult, bool);
 
-/// Global unbounded callback queue sender
-static CALLBACK_SENDER: std::sync::OnceLock<Sender<CallbackJob>> = std::sync::OnceLock::new();
+/// Global callback queue sender
+static CALLBACK_SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<CallbackJob>> = std::sync::OnceLock::new();
 
 fn get_callback_worker_threads() -> usize {
     if let Ok(val) = std::env::var("GLIDE_CALLBACK_WORKER_THREADS") {
@@ -398,7 +398,7 @@ fn get_callback_worker_threads() -> usize {
     }
 }
 
-pub fn init_callback_workers() -> &'static Sender<CallbackJob> {
+pub fn init_callback_workers() -> &'static std::sync::mpsc::Sender<CallbackJob> {
     CALLBACK_SENDER.get_or_init(|| {
         let (tx, rx) = channel::<CallbackJob>();
         let rx = Arc::new(std::sync::Mutex::new(rx));
@@ -418,8 +418,29 @@ pub fn init_callback_workers() -> &'static Sender<CallbackJob> {
                             break;
                         };
 
-                        // Process callback on this dedicated thread
-                        process_callback_job(jvm, callback_id, result, binary_mode);
+                        // Attach once and process this callback + any queued ones
+                        match jvm.attach_current_thread_as_daemon() {
+                            Ok(mut env) => {
+                                // Process first callback
+                                process_callback_attached(&mut env, callback_id, result, binary_mode);
+                                
+                                // Drain up to 99 more callbacks without re-attaching
+                                for _ in 0..99 {
+                                    let next_job = {
+                                        let guard = rx_clone.lock().unwrap();
+                                        guard.try_recv().ok()
+                                    };
+                                    if let Some((_, cb_id, res, bin_mode)) = next_job {
+                                        process_callback_attached(&mut env, cb_id, res, bin_mode);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to attach JVM thread for callback {}: {}", callback_id, e);
+                            }
+                        }
                     }
                 })
                 .expect("Failed to spawn callback worker thread");
@@ -429,9 +450,9 @@ pub fn init_callback_workers() -> &'static Sender<CallbackJob> {
     })
 }
 
-/// Drop callbacks that already timed out on the Java side.
-fn process_callback_job(
-    jvm: Arc<JavaVM>,
+/// Process callback with JNI env already attached (for batching).
+fn process_callback_attached(
+    env: &mut JNIEnv,
     callback_id: jlong,
     result: CallbackResult,
     binary_mode: bool,
@@ -440,56 +461,51 @@ fn process_callback_job(
         return;
     }
 
-    match jvm.attach_current_thread_as_daemon() {
-        Ok(mut env) => match result {
-            Ok(server_value) => {
-                let _ = env.push_local_frame(16);
+    match result {
+        Ok(server_value) => {
+            let _ = env.push_local_frame(16);
 
-                let java_result = if should_use_direct_buffer(&server_value) {
-                    create_direct_byte_buffer(&mut env, server_value, !binary_mode)
-                } else {
-                    crate::resp_value_to_java(&mut env, server_value, !binary_mode)
-                };
+            let java_result = if should_use_direct_buffer(&server_value) {
+                create_direct_byte_buffer(env, server_value, !binary_mode)
+            } else {
+                crate::resp_value_to_java(env, server_value, !binary_mode)
+            };
 
-                if take_timed_out_callback(callback_id) {
-                    let _ = unsafe { env.pop_local_frame(&JObject::null()) };
-                    return;
-                }
-
-                match java_result {
-                    Ok(java_result) => {
-                        let _ = complete_java_callback(&mut env, callback_id, &java_result);
-                    }
-                    Err(e) => {
-                        let error_code = 0;
-                        let error_msg = format!("Response conversion failed: {e}");
-                        let _ = complete_java_callback_with_error_code(
-                            &mut env,
-                            callback_id,
-                            error_code,
-                            &error_msg,
-                        );
-                    }
-                }
+            if take_timed_out_callback(callback_id) {
                 let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+                return;
             }
-            Err(server_err) => {
-                if take_timed_out_callback(callback_id) {
-                    return;
-                }
 
-                let error_code = error_type(&server_err) as i32;
-                let error_msg = error_message(&server_err);
-                let _ = complete_java_callback_with_error_code(
-                    &mut env,
-                    callback_id,
-                    error_code,
-                    &error_msg,
-                );
+            match java_result {
+                Ok(java_result) => {
+                    let _ = complete_java_callback(env, callback_id, &java_result);
+                }
+                Err(e) => {
+                    let error_code = 0;
+                    let error_msg = format!("Response conversion failed: {e}");
+                    let _ = complete_java_callback_with_error_code(
+                        env,
+                        callback_id,
+                        error_code,
+                        &error_msg,
+                    );
+                }
             }
-        },
-        Err(e) => {
-            log::error!("JNI environment attachment failed: {e}");
+            let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+        }
+        Err(server_err) => {
+            if take_timed_out_callback(callback_id) {
+                return;
+            }
+
+            let error_code = error_type(&server_err) as i32;
+            let error_msg = error_message(&server_err);
+            let _ = complete_java_callback_with_error_code(
+                env,
+                callback_id,
+                error_code,
+                &error_msg,
+            );
         }
     }
 }

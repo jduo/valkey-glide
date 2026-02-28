@@ -22,7 +22,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::thread::JoinHandle;
-use std::thread::{self, sleep};
+use std::thread;
 use std::time::Duration;
 use tokio::runtime::{Builder, Handle};
 pub use types::*;
@@ -64,6 +64,9 @@ pub const CONNECTION_CHECKS_INTERVAL: Duration = Duration::from_secs(3);
 
 /// A static Glide runtime instance
 static RUNTIME: OnceCell<GlideRt> = OnceCell::new();
+
+/// A dedicated runtime for timeout operations only
+static TIMEOUT_RUNTIME: OnceCell<GlideRt> = OnceCell::new();
 
 pub struct GlideRt {
     pub runtime: Handle,
@@ -110,10 +113,49 @@ pub fn get_or_init_runtime() -> Result<&'static GlideRt, String> {
     })
 }
 
+/// Initializes a dedicated single-threaded Tokio runtime for timeout operations only.
+/// This ensures timeouts can fire even when the main runtime is under heavy load.
+fn get_or_init_timeout_runtime() -> Result<&'static GlideRt, String> {
+    TIMEOUT_RUNTIME.get_or_try_init(|| {
+        let notify = Arc::new(Notify::new());
+        let notify_thread = notify.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let thread_handle = thread::Builder::new()
+            .name("glide-timeout-runtime".into())
+            .spawn(move || {
+                match Builder::new_current_thread().enable_all().build() {
+                    Ok(runtime) => {
+                        let _ = tx.send(Ok(runtime.handle().clone()));
+                        runtime.block_on(notify_thread.notified());
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(format!("Failed to create timeout runtime: {err}")));
+                    }
+                }
+            })
+            .map_err(|_| "Failed to spawn timeout runtime thread".to_string())?;
+
+        let runtime_handle = rx.recv()
+            .map_err(|_| "Timeout runtime channel closed".to_string())??;
+
+        Ok(GlideRt {
+            runtime: runtime_handle,
+            thread: Some(thread_handle),
+            shutdown_notifier: notify,
+        })
+    })
+}
+
 impl Drop for GlideRt {
     fn drop(&mut self) {
+        // Notify both runtimes to shutdown
         if let Some(rt) = RUNTIME.get() {
             rt.shutdown_notifier.notify_one();
+        }
+        if let Some(timeout_rt) = TIMEOUT_RUNTIME.get() {
+            timeout_rt.shutdown_notifier.notify_one();
         }
 
         // Move the JoinHandle out of the Option and join it
@@ -247,19 +289,33 @@ async fn run_with_timeout<T>(
     future: impl futures::Future<Output = RedisResult<T>> + Send,
 ) -> redis::RedisResult<T> {
     match timeout {
-        Some(duration) => match tokio::time::timeout(duration, future).await {
-            Ok(result) => result,
-            Err(_) => {
-                // Record timeout error metric if telemetry is initialized
-                if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
-                    log_error(
-                        "OpenTelemetry:timeout_error",
-                        format!("Failed to record timeout error: {e}"),
-                    );
+        Some(duration) => {
+            // Spawn timeout on dedicated multi-threaded runtime to ensure it fires even under load
+            let timeout_rt = get_or_init_timeout_runtime()
+                .map_err(|e| RedisError::from((ErrorKind::IoError, "timeout runtime init failed", e.to_string())))?;
+            
+            // Use oneshot channel for immediate timeout notification
+            let (timeout_tx, mut timeout_rx) = tokio::sync::oneshot::channel::<()>();
+            
+            timeout_rt.runtime.spawn(async move {
+                tokio::time::sleep(duration).await;
+                let _ = timeout_tx.send(()); // Signal timeout immediately
+            });
+
+            tokio::select! {
+                result = future => result,
+                _ = &mut timeout_rx => {
+                    // Record timeout error metric if telemetry is initialized
+                    if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
+                        log_error(
+                            "OpenTelemetry:timeout_error",
+                            format!("Failed to record timeout error: {e}"),
+                        );
+                    }
+                    Err(io::Error::from(io::ErrorKind::TimedOut).into())
                 }
-                Err(io::Error::from(io::ErrorKind::TimedOut).into())
             }
-        },
+        }
         None => future.await,
     }
 }
@@ -273,48 +329,67 @@ async fn run_with_timeout_with_callback<T>(
     let entered_timeout_at = std::time::Instant::now();
 
     match timeout {
-        Some(duration) => match tokio::time::timeout(duration, future).await {
-            Ok(result) => {
-                let total = entered_send_command_at.elapsed();
-                if total.as_millis() > 500 {
+        Some(duration) => {
+            // Spawn timeout on dedicated runtime to ensure it fires even under load
+            let timeout_rt = get_or_init_timeout_runtime()
+                .map_err(|e| RedisError::from((ErrorKind::IoError, "timeout runtime init failed", e)))?;
+            
+            // Use oneshot channel for immediate timeout notification
+            let (timeout_tx, mut timeout_rx) = tokio::sync::oneshot::channel::<()>();
+            
+            timeout_rt.runtime.spawn(async move {
+                tokio::time::sleep(duration).await;
+                let _ = timeout_tx.send(()); // Signal timeout immediately
+            });
+
+            let result = tokio::select! {
+                result = future => Ok(result),
+                _ = &mut timeout_rx => Err(()),
+            };
+
+            match result {
+                Ok(result) => {
+                    let total = entered_send_command_at.elapsed();
+                    if total.as_millis() > 500 {
+                        log_warn(
+                            "send_command_with_callback_id",
+                            format!(
+                                "SLOW COMMAND TIMING | callback_id={:?} | send_cmd_to_timeout={}ms | timeout_to_future_start=<inside> | total={}ms | result={}",
+                                callback_id,
+                                entered_timeout_at
+                                    .duration_since(entered_send_command_at)
+                                    .as_millis(),
+                                total.as_millis(),
+                                if result.is_ok() { "ok" } else { "err" },
+                            ),
+                        );
+                    }
+                    result
+                }
+                Err(_) => {
+                    let total = entered_send_command_at.elapsed();
                     log_warn(
-                        "send_command_with_callback_id",
+                        "send_command",
                         format!(
-                            "SLOW COMMAND TIMING | callback_id={:?} | send_cmd_to_timeout={}ms | timeout_to_future_start=<inside> | total={}ms | result={}",
+                            "TIMEOUT TIMING | callback_id={:?} | send_cmd_to_timeout={}ms | total={}ms | expected={}ms",
                             callback_id,
                             entered_timeout_at
                                 .duration_since(entered_send_command_at)
                                 .as_millis(),
                             total.as_millis(),
-                            if result.is_ok() { "ok" } else { "err" },
+                            duration.as_millis(),
                         ),
                     );
+                    if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
+                        log_error(
+                            "OpenTelemetry:timeout_error",
+                            format!("Failed to record timeout error: {e}"),
+                        );
+                    }
+                    Err(io::Error::from(io::ErrorKind::TimedOut).into())
                 }
-                result
             }
-            Err(_) => {
-                let total = entered_send_command_at.elapsed();
-                log_warn(
-                    "send_command",
-                    format!(
-                        "TIMEOUT TIMING | callback_id={:?} | send_cmd_to_timeout={}ms | total={}ms | expected={}ms",
-                        callback_id,
-                        entered_timeout_at
-                            .duration_since(entered_send_command_at)
-                            .as_millis(),
-                        total.as_millis(),
-                        duration.as_millis(),
-                    ),
-                );
-                if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
-                    log_error(
-                        "OpenTelemetry:timeout_error",
-                        format!("Failed to record timeout error: {e}"),
-                    );
-                }
-                Err(io::Error::from(io::ErrorKind::TimedOut).into())
-            }
-        },
+        }
         None => future.await,
     }
 }

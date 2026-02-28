@@ -44,6 +44,7 @@ use crate::{
     types::ServerError,
     FromRedisValue, InfoDict, PipelineRetryStrategy,
 };
+use arc_swap::ArcSwap;
 use connections_container::{RefreshTaskNotifier, RefreshTaskState, RefreshTaskStatus};
 use dashmap::DashMap;
 use pipeline_routing::{
@@ -56,12 +57,12 @@ use rand::seq::IteratorRandom;
 
 use std::{
     collections::{HashMap, HashSet},
-    fmt, io, mem,
+    fmt, io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
         atomic::{self, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     task::{self, Poll},
     time::SystemTime,
@@ -122,8 +123,6 @@ use self::{
 };
 use crate::types::RetryMethod;
 
-pub(crate) const MUTEX_READ_ERR: &str = "Failed to obtain read lock. Poisoned mutex?";
-const MUTEX_WRITE_ERR: &str = "Failed to obtain write lock. Poisoned mutex?";
 /// This represents an async Cluster connection. It stores the
 /// underlying connections maintained for each node in the cluster, as well
 /// as common parameters for connecting to nodes and executing commands.
@@ -434,6 +433,8 @@ pub(crate) struct InnerCore<C> {
     subscriptions_by_address: TokioRwLock<HashMap<String, PubSubSubscriptionInfo>>,
     unassigned_subscriptions: TokioRwLock<PubSubSubscriptionInfo>,
     glide_connection_options: GlideConnectionOptions,
+    /// Lock-free slot map access via ArcSwap. Updated atomically during topology refresh.
+    pub(crate) slot_map: Arc<ArcSwap<SlotMap>>,
 }
 
 pub(crate) type Core<C> = Arc<InnerCore<C>>;
@@ -1178,6 +1179,9 @@ where
             ),
             subscriptions_by_address: TokioRwLock::new(Default::default()),
             glide_connection_options,
+            slot_map: Arc::new(ArcSwap::from_pointee(SlotMap::new_with_read_strategy(
+                cluster_params.read_from_replicas.clone(),
+            ))),
         });
         let mut connection = ClusterConnInner {
             inner,
@@ -2375,6 +2379,8 @@ where
             read_from_replicas,
             topology_hash,
         );
+        // Publish updated slot_map to lock-free readers
+        inner.slot_map.store(Arc::new(write_guard.slot_map.clone()));
         Ok(())
     }
 
@@ -2403,12 +2409,9 @@ where
         slot: u16,
         new_primary: Arc<String>,
     ) -> RedisResult<()> {
-        let curr_shard_addrs = inner
-            .conn_lock
-            .read().await
-            .slot_map
-            .shard_addrs_for_slot(slot);
-        // let curr_shard_addrs = connections_container.slot_map.shard_addrs_for_slot(slot);
+        let slot_map = inner.slot_map.load();
+        let curr_shard_addrs = slot_map.shard_addrs_for_slot(slot);
+        
         // Check if the new primary is part of the current shard and update if required
         if let Some(curr_shard_addrs) = curr_shard_addrs {
             match curr_shard_addrs.attempt_shard_role_update(new_primary.clone()) {
@@ -2431,28 +2434,40 @@ where
                     // Scenario 3: Slot Migration - The new primary is an existing primary in another shard
                     // Update the associated addresses for `slot` to `shard_addrs`.
                     drop(nodes_iter);
-                    return wlock_conn_container
+                    let result = wlock_conn_container
                         .slot_map
                         .update_slot_range(slot, shard_addrs_arc.clone());
+                    if result.is_ok() {
+                        inner.slot_map.store(Arc::new(wlock_conn_container.slot_map.clone()));
+                    }
+                    return result;
                 } else {
                     // Scenario 4: The MOVED error redirects to `new_primary` which is known as a replica in a shard that doesn’t own `slot`.
                     // Remove the replica from its existing shard and treat it as a new node in a new shard.
                     shard_addrs_arc.remove_replica(new_primary.clone())?;
                     drop(nodes_iter);
-                    return wlock_conn_container.slot_map.add_new_primary(
+                    let result = wlock_conn_container.slot_map.add_new_primary(
                         slot,
                         new_primary,
                         ip_addr,
                     );
+                    if result.is_ok() {
+                        inner.slot_map.store(Arc::new(wlock_conn_container.slot_map.clone()));
+                    }
+                    return result;
                 }
             }
         }
 
         drop(nodes_iter);
         // Scenario 5: New Node - The new primary is not present in the current slots map, add it as a primary of a new shard.
-        wlock_conn_container
+        let result = wlock_conn_container
             .slot_map
-            .add_new_primary(slot, new_primary, None)
+            .add_new_primary(slot, new_primary, None);
+        if result.is_ok() {
+            inner.slot_map.store(Arc::new(wlock_conn_container.slot_map.clone()));
+        }
+        result
     }
 
     async fn execute_on_multiple_nodes<'a>(
@@ -2861,12 +2876,17 @@ where
                     )
             }
             InternalSingleNodeRouting::SpecificNode(route) => {
-                // Step 1: Attempt to get the connection directly using the route.
-                let conn_check = {
+                // Step 1: Lock-free fast path - try to get connection using ArcSwap slot_map
+                let slot_map = core.slot_map.load();
+                let addr = slot_map.slot_addr_for_route(&route);
+                
+                let conn_check = if let Some(addr) = addr {
+                    // Lock-free connection lookup via DashMap
                     let conn_lock = core.conn_lock.read().await;
-                    conn_lock
-                        .connection_for_route(&route)
+                    conn_lock.connection_for_address(&addr)
                         .map(ConnectionCheck::Found)
+                } else {
+                    None
                 };
 
                 if let Some(conn_check) = conn_check {
