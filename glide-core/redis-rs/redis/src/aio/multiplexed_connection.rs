@@ -378,38 +378,43 @@ where
         timeout: Duration,
         is_atomic: bool,
     ) -> Result<Value, RedisError> {
-        let (sender, receiver) = oneshot::channel();
+        let sender_clone = self.sender.clone();
 
-        self.sender
-            .send(PipelineMessage {
-                input,
-                pipeline_response_count,
-                output: sender,
-                is_transaction: is_atomic,
-            })
-            .await
-            .map_err(|err| {
-                // If an error occurs here, it means the request never reached the server, as guaranteed
-                // by the 'send' function. Since the server did not receive the data, it is safe to retry
-                // the request.
+        // Wrap the ENTIRE send+receive in the timeout so that callers never block
+        // longer than `response_timeout`, even when the pipeline channel is full
+        // (e.g. during a network partition where PipelineSink cannot flush).
+        let request = async move {
+            let (tx, rx) = oneshot::channel();
+
+            sender_clone
+                .send(PipelineMessage {
+                    input,
+                    pipeline_response_count,
+                    output: tx,
+                    is_transaction: is_atomic,
+                })
+                .await
+                .map_err(|err| {
+                    // Request never reached the server — safe to retry.
+                    RedisError::from((
+                        crate::ErrorKind::FatalSendError,
+                        "Failed to send the request to the server",
+                        err.to_string(),
+                    ))
+                })?;
+
+            rx.await.map_err(|err| {
+                // The sender was dropped — unclear if server received the request.
                 RedisError::from((
-                    crate::ErrorKind::FatalSendError,
-                    "Failed to send the request to the server",
-                    err.to_string(),
-                ))
-            })?;
-        match Runtime::locate().timeout(timeout, receiver).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(err)) => {
-                // The `sender` was dropped, likely indicating a failure in the stream.
-                // This error suggests that it's unclear whether the server received the request before the connection failed,
-                // making it unsafe to retry. For example, retrying an INCR request could result in double increments.
-                Err(RedisError::from((
                     crate::ErrorKind::FatalReceiveError,
                     "Failed to receive a response due to a fatal error",
                     err.to_string(),
-                )))
-            }
+                ))
+            })?
+        };
+
+        match Runtime::locate().timeout(timeout, request).await {
+            Ok(result) => result,
             Err(elapsed) => Err(elapsed.into()),
         }
     }
