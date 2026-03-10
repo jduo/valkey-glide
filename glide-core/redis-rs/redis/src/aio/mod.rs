@@ -83,6 +83,12 @@ pub trait ConnectionLike {
     /// Returns the state of the connection
     fn is_closed(&self) -> bool;
 
+    /// Returns the epoch millis of the last response received on this connection.
+    /// Returns 0 if not supported by the implementation.
+    fn last_response_time_millis(&self) -> u64 {
+        0
+    }
+
     /// Get the connection availibility zone
     fn get_az(&self) -> Option<String> {
         None
