@@ -1417,14 +1417,54 @@ where
             }
         }
 
-        // identify nodes with closed connection
+        // identify nodes with closed or unresponsive connections
         let mut addrs_to_refresh = HashSet::new();
         for (addr, con_fut) in &all_valid_conns {
-            let con = con_fut.clone().await;
+            let mut con = con_fut.clone().await;
             // connection object might be present despite the transport being closed
             if con.is_closed() {
                 // transport is closed, need to refresh
                 addrs_to_refresh.insert(addr.clone());
+                continue;
+            }
+            // Active health check: send PING with a short timeout to detect half-closed connections
+            // that pass the is_closed() check but cannot actually communicate.
+            // Optimization: skip PING for connections with recent activity (within last 5s).
+            const STUCK_THRESHOLD_MS: u64 = 5_000;
+            const PING_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+            let last_response = con.last_response_time_millis();
+            let now_millis = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let idle_ms = now_millis.saturating_sub(last_response);
+            if idle_ms < STUCK_THRESHOLD_MS {
+                // Connection had recent activity, skip PING
+                continue;
+            }
+            let ping_result = timeout(
+                PING_HEALTH_CHECK_TIMEOUT,
+                con.req_packed_command(&cmd("PING")),
+            )
+            .await;
+            match ping_result {
+                Ok(Ok(_)) => {
+                    // Connection is healthy
+                }
+                Ok(Err(err)) => {
+                    debug!(
+                        "PING health check failed for {}: {:?} - scheduling reconnection",
+                        addr, err
+                    );
+                    addrs_to_refresh.insert(addr.clone());
+                }
+                Err(_elapsed) => {
+                    debug!(
+                        "PING health check timed out for {} after {:?} - scheduling reconnection",
+                        addr, PING_HEALTH_CHECK_TIMEOUT
+                    );
+                    addrs_to_refresh.insert(addr.clone());
+                }
             }
         }
 

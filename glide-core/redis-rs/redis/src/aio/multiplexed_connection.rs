@@ -20,15 +20,16 @@ use futures_util::{
     sink::Sink,
     stream::{self, Stream, StreamExt, TryStreamExt as _},
 };
+use logger_core::log_error;
 use pin_project_lite::pin_project;
 use std::collections::VecDeque;
 use std::fmt;
 use std::fmt::Debug;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{self, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "tokio-comp")]
 use tokio_util::codec::Decoder;
 
@@ -87,6 +88,7 @@ pub(crate) struct Pipeline<SinkItem> {
     sender: mpsc::Sender<PipelineMessage<SinkItem>>,
     push_manager: Arc<ArcSwap<PushManager>>,
     is_stream_closed: Arc<AtomicBool>,
+    last_response_time: Arc<AtomicU64>,
 }
 
 impl<SinkItem> Debug for Pipeline<SinkItem>
@@ -107,6 +109,12 @@ pin_project! {
         push_manager: Arc<ArcSwap<PushManager>>,
         disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
         is_stream_closed: Arc<AtomicBool>,
+        // Write timeout: if poll_flush returns Pending for longer than this, declare connection dead.
+        write_timeout: Duration,
+        // Tracks when the current flush started returning Pending.
+        flush_start: Option<Instant>,
+        // Epoch millis of last successful response received.
+        last_response_time: Arc<AtomicU64>,
     }
 }
 
@@ -119,6 +127,8 @@ where
         push_manager: Arc<ArcSwap<PushManager>>,
         disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
         is_stream_closed: Arc<AtomicBool>,
+        write_timeout: Duration,
+        last_response_time: Arc<AtomicU64>,
     ) -> Self
     where
         T: Sink<SinkItem, Error = RedisError> + Stream<Item = RedisResult<Value>> + 'static,
@@ -130,6 +140,9 @@ where
             push_manager,
             disconnect_notifier,
             is_stream_closed,
+            write_timeout,
+            flush_start: None,
+            last_response_time,
         }
     }
 
@@ -156,6 +169,14 @@ where
 
     fn send_result(self: Pin<&mut Self>, result: RedisResult<Value>) {
         let self_ = self.project();
+
+        // Update last_response_time — any response (even error) means the connection is alive.
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self_.last_response_time.store(now_millis, Ordering::Relaxed);
+
         let mut skip_value = false;
         if let Ok(res) = &result {
             if let Value::Push { kind, data: _data } = res {
@@ -298,15 +319,64 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut task::Context,
     ) -> Poll<Result<(), Self::Error>> {
-        ready!(self
+        match self
             .as_mut()
             .project()
             .sink_stream
             .poll_flush(cx)
-            .map_err(|err| {
+        {
+            Poll::Ready(Ok(())) => {
+                // Flush completed — reset the deadline
+                *self.as_mut().project().flush_start = None;
+                self.poll_read(cx)
+            }
+            Poll::Ready(Err(err)) => {
+                *self.as_mut().project().flush_start = None;
                 self.as_mut().send_result(Err(err));
-            }))?;
-        self.poll_read(cx)
+                Poll::Ready(Err(()))
+            }
+            Poll::Pending => {
+                let this = self.as_mut().project();
+                let now = Instant::now();
+                let start = this.flush_start.get_or_insert(now);
+                if now.duration_since(*start) >= *this.write_timeout {
+                    // Write timeout exceeded — connection is stuck (half-closed TCP).
+                    log_error(
+                        "PipelineSink",
+                        format!(
+                            "Write timeout ({:?}) exceeded on flush — declaring connection dead. Draining {} in-flight requests.",
+                            this.write_timeout,
+                            this.in_flight.len()
+                        ),
+                    );
+                    this.is_stream_closed.store(true, Ordering::Relaxed);
+                    if let Some(notifier) = this.disconnect_notifier {
+                        notifier.notify_disconnect();
+                    }
+                    // Drain all pending InFlight entries
+                    while let Some(entry) = this.in_flight.pop_front() {
+                        let err = RedisError::from((
+                            crate::ErrorKind::FatalSendError,
+                            "Write timeout exceeded - connection appears dead (half-closed TCP)",
+                        ));
+                        entry.output.send(Err(err)).ok();
+                    }
+                    *this.flush_start = None;
+                    return Poll::Ready(Err(()));
+                }
+                // Schedule a wakeup to re-check the timeout
+                let waker = cx.waker().clone();
+                let remaining = *this.write_timeout - now.duration_since(*start);
+                tokio::spawn(async move {
+                    tokio::time::sleep(remaining).await;
+                    waker.wake();
+                });
+                // Also try to read responses while flush is pending
+                drop(this);
+                let _ = self.as_mut().poll_read(cx);
+                Poll::Pending
+            }
+        }
     }
 
     fn poll_close(
@@ -332,6 +402,7 @@ where
     fn new<T>(
         sink_stream: T,
         disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+        write_timeout: Duration,
     ) -> (Self, impl Future<Output = ()>)
     where
         T: Sink<SinkItem, Error = RedisError> + Stream<Item = RedisResult<Value>> + 'static,
@@ -340,16 +411,25 @@ where
         T::Error: Send,
         T::Error: ::std::fmt::Debug,
     {
-        const BUFFER_SIZE: usize = 50;
+        // Channel capacity: 10,000 provides backpressure when PipelineSink is stuck
+        // (e.g., half-closed TCP) while being well above normal operating levels.
+        const BUFFER_SIZE: usize = 10_000;
         let (sender, mut receiver) = mpsc::channel(BUFFER_SIZE);
         let push_manager: Arc<ArcSwap<PushManager>> =
             Arc::new(ArcSwap::new(Arc::new(PushManager::default())));
         let is_stream_closed = Arc::new(AtomicBool::new(false));
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last_response_time = Arc::new(AtomicU64::new(now_millis));
         let sink = PipelineSink::new::<SinkItem>(
             sink_stream,
             push_manager.clone(),
             disconnect_notifier,
             is_stream_closed.clone(),
+            write_timeout,
+            last_response_time.clone(),
         );
         let f = stream::poll_fn(move |cx| receiver.poll_recv(cx))
             .map(Ok)
@@ -360,6 +440,7 @@ where
                 sender,
                 push_manager,
                 is_stream_closed,
+                last_response_time,
             },
             f,
         )
@@ -423,6 +504,11 @@ where
     pub fn is_closed(&self) -> bool {
         self.is_stream_closed.load(Ordering::Relaxed)
     }
+
+    /// Returns the epoch millis of the last response received on this pipeline.
+    pub fn last_response_time_millis(&self) -> u64 {
+        self.last_response_time.load(Ordering::Relaxed)
+    }
 }
 
 /// A connection object which can be cloned, allowing requests to be be sent concurrently
@@ -481,8 +567,11 @@ impl MultiplexedConnection {
         let codec = ValueCodec::default()
             .framed(stream)
             .and_then(|msg| async move { msg });
+        // Default write timeout: 5 seconds. If poll_flush is stuck longer than this,
+        // the connection is declared dead (half-closed TCP detection).
+        const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
         let (mut pipeline, driver) =
-            Pipeline::new(codec, glide_connection_options.disconnect_notifier);
+            Pipeline::new(codec, glide_connection_options.disconnect_notifier, DEFAULT_WRITE_TIMEOUT);
         let driver = Box::pin(driver);
         let pm = PushManager::default();
         if let Some(sender) = glide_connection_options.push_sender {
@@ -727,6 +816,10 @@ impl ConnectionLike for MultiplexedConnection {
 
     fn is_closed(&self) -> bool {
         self.pipeline.is_closed()
+    }
+
+    fn last_response_time_millis(&self) -> u64 {
+        self.pipeline.last_response_time_millis()
     }
 
     /// Get the node's availability zone
