@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Mapping, Optional, Set, Union, cast
 
-from glide.glide import ClusterScanCursor, Script
+from glide_sync.sync_commands.cluster_scan_cursor import ClusterScanCursor
+from glide_sync.sync_commands.script import Script
 from glide_shared.commands.batch import ClusterBatch
 from glide_shared.commands.batch_options import ClusterBatchOptions
 from glide_shared.commands.command_args import ObjectType

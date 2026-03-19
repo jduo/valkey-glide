@@ -152,6 +152,11 @@ class _GlideFFI:
                 bool immediate_authentication
             );
 
+            CommandResult* refresh_iam_token(
+                const void* client_adapter_ptr,
+                uintptr_t request_id
+            );
+
             // ============== CLIENT MANAGEMENT ==============
             typedef enum {
                 Async = 0,

@@ -1,7 +1,7 @@
 # Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 from typing import Dict, List, Mapping, Optional, Protocol, Set, Tuple, Union, cast
 
-from glide.glide import ClusterScanCursor
+from glide_sync.sync_commands.cluster_scan_cursor import ClusterScanCursor
 from glide_shared.commands.bitmap import (
     BitFieldGet,
     BitFieldSubCommands,
