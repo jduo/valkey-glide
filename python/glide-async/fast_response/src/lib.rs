@@ -2,7 +2,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use std::os::raw::c_char;
 
-/// CommandResponse layout — must match ffi/src/lib.rs exactly (96 bytes on 64-bit).
+/// CommandResponse layout — must match ffi/src/lib.rs exactly.
 #[repr(C)]
 struct CommandResponse {
     response_type: i32,
@@ -19,6 +19,7 @@ struct CommandResponse {
     map_value: *const CommandResponse,
     sets_value: *const CommandResponse,
     sets_value_len: i64,
+    user_data: *mut std::ffi::c_void,
 }
 
 unsafe fn convert(resp: *const CommandResponse) -> *mut ffi::PyObject {
@@ -35,27 +36,25 @@ unsafe fn convert(resp: *const CommandResponse) -> *mut ffi::PyObject {
             ffi::PyBytes_FromStringAndSize(r.string_value, r.string_value_len as isize)
         },
         5 => unsafe {
-            // Array
             let len = r.array_value_len as isize;
             let list = ffi::PyList_New(len);
             if list.is_null() { return std::ptr::null_mut(); }
             for i in 0..len {
                 let item = convert(r.array_value.offset(i));
                 if item.is_null() { ffi::Py_DECREF(list); return std::ptr::null_mut(); }
-                ffi::PyList_SetItem(list, i, item); // steals ref
+                ffi::PyList_SetItem(list, i, item);
             }
             list
         },
         6 => unsafe {
-            // Map
-            let len = r.array_value_len as isize;
+            // Map — flat layout: [k0, v0, k1, v1, ...], array_value_len = num entries
+            let n = r.array_value_len as isize;
             let dict = ffi::PyDict_New();
             if dict.is_null() { return std::ptr::null_mut(); }
-            for i in 0..len {
-                let entry = &*r.array_value.offset(i);
-                let key = convert(entry.map_key);
+            for i in 0..n {
+                let key = convert(r.array_value.offset(i * 2));
                 if key.is_null() { ffi::Py_DECREF(dict); return std::ptr::null_mut(); }
-                let val = convert(entry.map_value);
+                let val = convert(r.array_value.offset(i * 2 + 1));
                 if val.is_null() { ffi::Py_DECREF(key); ffi::Py_DECREF(dict); return std::ptr::null_mut(); }
                 ffi::PyDict_SetItem(dict, key, val);
                 ffi::Py_DECREF(key);
@@ -64,7 +63,6 @@ unsafe fn convert(resp: *const CommandResponse) -> *mut ffi::PyObject {
             dict
         },
         7 => unsafe {
-            // Set
             let len = r.sets_value_len as isize;
             let set = ffi::PySet_New(std::ptr::null_mut());
             if set.is_null() { return std::ptr::null_mut(); }
@@ -77,28 +75,27 @@ unsafe fn convert(resp: *const CommandResponse) -> *mut ffi::PyObject {
             set
         },
         8 => unsafe {
-            // OK — return str "OK"
             ffi::PyUnicode_FromStringAndSize(b"OK\0".as_ptr() as *const c_char, 2)
         },
         9 => unsafe {
-            // Error — return as bytes, caller handles
             ffi::PyBytes_FromStringAndSize(r.string_value, r.string_value_len as isize)
         },
         _ => unsafe { ffi::Py_NewRef(ffi::Py_None()) },
     }
 }
 
-/// Parse a CommandResponse pointer (as integer) into a native Python object.
+/// Parse a CommandResponse and return (result, arena_ptr).
+/// The caller must call free_response_arena(arena_ptr) when done.
 #[pyfunction]
-fn parse_response(py: Python<'_>, ptr: usize) -> PyObject {
+fn parse_response(py: Python<'_>, ptr: usize) -> (PyObject, usize) {
     if ptr == 0 {
-        return py.None();
+        return (py.None(), 0);
     }
-    let raw = unsafe { convert(ptr as *const CommandResponse) };
-    if raw.is_null() {
-        return py.None();
-    }
-    unsafe { PyObject::from_owned_ptr(py, raw) }
+    let resp = ptr as *const CommandResponse;
+    let arena_ptr = unsafe { (*resp).user_data as usize };
+    let raw = unsafe { convert(resp) };
+    let obj = if raw.is_null() { py.None() } else { unsafe { PyObject::from_owned_ptr(py, raw) } };
+    (obj, arena_ptr)
 }
 
 #[pymodule]

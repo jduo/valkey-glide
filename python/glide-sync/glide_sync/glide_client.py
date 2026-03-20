@@ -236,7 +236,9 @@ class BaseClient(CoreCommands):
         if message == self._ffi.NULL:
             raise RequestError("Received NULL message.")
         addr = int(self._ffi.cast("uintptr_t", message))
-        return _fast_parse_response(addr)
+        result, _arena_ptr = _fast_parse_response(addr)
+        # Arena is freed by free_command_result in _handle_cmd_result's finally block
+        return result
 
     def _handle_command_response(self, msg):
         """Handle a CommandResponse message based on its response type."""

@@ -166,10 +166,16 @@ class BaseClient(CoreCommands):
 
     def _on_success(self, index_ptr: int, message) -> None:
         """Called from Rust thread on command success."""
-        try:
-            result = self._handle_response(message)
-        except Exception as e:
-            result = e
+        if message == self._ffi.NULL:
+            result = None
+        else:
+            addr = int(self._ffi.cast("uintptr_t", message))
+            try:
+                result, arena_ptr = _c_parse_response(addr)
+                if arena_ptr:
+                    self._lib.free_response_arena(self._ffi.cast("void*", arena_ptr))
+            except Exception as e:
+                result = e
 
         fut = self._pending_futures.pop(index_ptr, None)
         if fut is not None and not fut.done():
@@ -283,7 +289,10 @@ class BaseClient(CoreCommands):
         if message == self._ffi.NULL:
             return None
         addr = int(self._ffi.cast("uintptr_t", message))
-        return _c_parse_response(addr)
+        result, arena_ptr = _c_parse_response(addr)
+        if arena_ptr:
+            self._lib.free_response_arena(self._ffi.cast("void*", arena_ptr))
+        return result
 
     def _parse_response_cffi(self, addr):
         """Fallback CFFI-based response parser when C extension is unavailable."""
