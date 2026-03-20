@@ -23,7 +23,7 @@ from glide_shared.constants import (
     TResult,
 )
 from glide_shared.exceptions import RequestError
-from glide_shared.protobuf.command_request_pb2 import RequestType
+from glide.async_commands.core import RequestType
 from glide_shared.routes import Route
 
 from .core import CoreCommands

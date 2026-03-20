@@ -20,7 +20,7 @@ from glide_shared.constants import (
     TFunctionStatsFullResponse,
     TResult,
 )
-from glide_shared.protobuf.command_request_pb2 import RequestType
+from glide.async_commands.core import RequestType
 
 from .core import CoreCommands
 

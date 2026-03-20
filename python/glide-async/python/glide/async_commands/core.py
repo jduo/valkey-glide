@@ -60,8 +60,22 @@ from glide_shared.constants import (
     TXInfoStreamResponse,
 )
 from glide_shared.exceptions import RequestError
-from glide_shared.protobuf.command_request_pb2 import RequestType
+from glide_shared.protobuf.command_request_pb2 import RequestType as _RequestType
 from glide_shared.routes import Route
+
+
+class _CachedRequestType:
+    """Cache protobuf enum int values to avoid repeated __getattr__ through enum_type_wrapper.
+    Each uncached access costs ~0.5μs due to protobuf descriptor lookup."""
+    def __init__(self):
+        src = _RequestType
+        for v in src.DESCRIPTOR.values:
+            setattr(self, v.name, v.number)
+        self.ValueType = src.ValueType
+        self.Name = src.Name
+
+
+RequestType = _CachedRequestType()
 
 
 class CoreCommands(Protocol):

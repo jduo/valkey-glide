@@ -36,7 +36,7 @@ from glide_shared.exceptions import (
     RequestError,
     get_request_error_class,
 )
-from glide_shared.protobuf.command_request_pb2 import RequestType
+from glide.async_commands.core import RequestType
 from glide_shared.routes import Route, build_protobuf_route
 
 from .async_commands.cluster_commands import ClusterCommands
@@ -45,6 +45,8 @@ from .async_commands.standalone_commands import StandaloneCommands
 from .logger import Level as LogLevel
 from .logger import Logger as ClientLogger
 from .opentelemetry import OpenTelemetry
+
+from _fast_response import parse_response as _c_parse_response
 
 if sys.version_info >= (3, 11):
     from typing import Self
@@ -159,9 +161,8 @@ class BaseClient(CoreCommands):
     # ==================== Callback Handling ====================
 
     def _get_callback_id(self) -> int:
-        with self._lock:
-            self._callback_counter += 1
-            return self._callback_counter
+        self._callback_counter += 1
+        return self._callback_counter
 
     def _on_success(self, index_ptr: int, message) -> None:
         """Called from Rust thread on command success."""
@@ -170,18 +171,12 @@ class BaseClient(CoreCommands):
         except Exception as e:
             result = e
 
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            return
-
-        with self._lock:
-            fut = self._pending_futures.pop(index_ptr, None)
-
+        fut = self._pending_futures.pop(index_ptr, None)
         if fut is not None and not fut.done():
             if isinstance(result, Exception):
-                loop.call_soon_threadsafe(fut.set_exception, result)
+                self._loop.call_soon_threadsafe(fut.set_exception, result)
             else:
-                loop.call_soon_threadsafe(fut.set_result, result)
+                self._loop.call_soon_threadsafe(fut.set_result, result)
 
     def _on_failure(self, index_ptr: int, error_message, error_type: int) -> None:
         """Called from Rust thread on command failure."""
@@ -190,18 +185,11 @@ class BaseClient(CoreCommands):
         except Exception:
             msg = "Unknown error"
 
-        error_class = get_request_error_class(error_type)
-        exc = error_class(msg)
+        exc = get_request_error_class(error_type)(msg)
 
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            return
-
-        with self._lock:
-            fut = self._pending_futures.pop(index_ptr, None)
-
+        fut = self._pending_futures.pop(index_ptr, None)
         if fut is not None and not fut.done():
-            loop.call_soon_threadsafe(fut.set_exception, exc)
+            self._loop.call_soon_threadsafe(fut.set_exception, exc)
 
     # ==================== PubSub ====================
 
@@ -294,7 +282,12 @@ class BaseClient(CoreCommands):
     def _handle_response(self, message):
         if message == self._ffi.NULL:
             return None
-        msg = message[0] if self._ffi.typeof(message).cname == "CommandResponse *" else message
+        addr = int(self._ffi.cast("uintptr_t", message))
+        return _c_parse_response(addr)
+
+    def _parse_response_cffi(self, addr):
+        """Fallback CFFI-based response parser when C extension is unavailable."""
+        msg = self._ffi.cast("struct CommandResponse*", addr)[0]
         return self._handle_command_response(msg)
 
     def _handle_command_response(self, msg):
@@ -346,25 +339,17 @@ class BaseClient(CoreCommands):
 
     # ==================== FFI Helpers ====================
 
+    @staticmethod
+    def _encode_arg(arg):
+        return arg.encode(ENCODING) if isinstance(arg, str) else bytes(arg) if isinstance(arg, (bytearray, memoryview)) else arg
+
     def _to_c_strings(self, args):
-        c_strings = []
-        string_lengths = []
-        buffers = []
-        for arg in args:
-            if isinstance(arg, str):
-                arg_bytes = arg.encode(ENCODING)
-            elif isinstance(arg, (bytes, bytearray, memoryview)):
-                arg_bytes = bytes(arg)
-            else:
-                raise TypeError(f"Unsupported argument type: {type(arg)}")
-            buffers.append(arg_bytes)
-            c_strings.append(self._ffi.cast("size_t", self._ffi.from_buffer(arg_bytes)))
-            string_lengths.append(len(arg_bytes))
-        return (
-            self._ffi.new("size_t[]", c_strings),
-            self._ffi.new("unsigned long[]", string_lengths),
-            buffers,
-        )
+        ffi = self._ffi
+        encode = self._encode_arg
+        buffers = [encode(a) for a in args]
+        c_strings = ffi.new("size_t[]", [ffi.cast("size_t", ffi.from_buffer(b)) for b in buffers])
+        c_lengths = ffi.new("unsigned long[]", [len(b) for b in buffers])
+        return c_strings, c_lengths, buffers
 
     def _to_c_route_ptr_and_len(self, route: Optional[Route]):
         proto_route = build_protobuf_route(route)
@@ -395,37 +380,32 @@ class BaseClient(CoreCommands):
         callback_id = self._get_callback_id()
         fut = self._loop.create_future()
 
-        with self._lock:
-            self._pending_futures[callback_id] = fut
-
-        # Create span if OpenTelemetry is configured
-        span = 0
-        span_name_cstr = None
-        if OpenTelemetry.should_sample():
-            command_name = RequestType.Name(request_type)
-            span_name_cstr = self._ffi.new("char[]", command_name.encode())
-            span = self._lib.create_named_otel_span(span_name_cstr)
+        self._pending_futures[callback_id] = fut
 
         c_args, c_lengths, buffers = self._to_c_strings(args)
-        route_ptr, route_len, route_bytes = self._to_c_route_ptr_and_len(route)
 
-        # For AsyncClient, command() returns NULL — callback resolves the future
-        self._lib.command(
-            self._core_client,
-            callback_id,
-            request_type,
-            len(args),
-            c_args,
-            c_lengths,
-            route_ptr,
-            route_len,
-            span,
-        )
+        # OTel span creation only when initialized (rare)
+        span = 0
+        if OpenTelemetry._instance is not None and OpenTelemetry.should_sample():
+            span_name_cstr = self._ffi.new("char[]", RequestType.Name(request_type).encode())
+            span = self._lib.create_named_otel_span(span_name_cstr)
+
+        if route is None:
+            self._lib.command(
+                self._core_client, callback_id, request_type,
+                len(args), c_args, c_lengths, self._ffi.NULL, 0, span,
+            )
+        else:
+            route_ptr, route_len, route_bytes = self._to_c_route_ptr_and_len(route)
+            self._lib.command(
+                self._core_client, callback_id, request_type,
+                len(args), c_args, c_lengths, route_ptr, route_len, span,
+            )
 
         try:
             return await fut
         finally:
-            if span != 0:
+            if span:
                 self._lib.drop_otel_span(span)
 
     async def _execute_batch(
@@ -446,8 +426,7 @@ class BaseClient(CoreCommands):
         callback_id = self._get_callback_id()
         fut = self._loop.create_future()
 
-        with self._lock:
-            self._pending_futures[callback_id] = fut
+        self._pending_futures[callback_id] = fut
 
         span = 0
         if OpenTelemetry.should_sample():
@@ -540,8 +519,7 @@ class BaseClient(CoreCommands):
         callback_id = self._get_callback_id()
         fut = self._loop.create_future()
 
-        with self._lock:
-            self._pending_futures[callback_id] = fut
+        self._pending_futures[callback_id] = fut
 
         if keys is None:
             keys = []
@@ -583,8 +561,7 @@ class BaseClient(CoreCommands):
         callback_id = self._get_callback_id()
         fut = self._loop.create_future()
 
-        with self._lock:
-            self._pending_futures[callback_id] = fut
+        self._pending_futures[callback_id] = fut
 
         c_password = (
             self._ffi.new("char[]", password.encode(ENCODING))
@@ -613,8 +590,7 @@ class BaseClient(CoreCommands):
         callback_id = self._get_callback_id()
         fut = self._loop.create_future()
 
-        with self._lock:
-            self._pending_futures[callback_id] = fut
+        self._pending_futures[callback_id] = fut
 
         self._lib.refresh_iam_token(
             self._core_client,
@@ -728,8 +704,7 @@ class GlideClusterClient(BaseClient, ClusterCommands):
         callback_id = self._get_callback_id()
         fut = self._loop.create_future()
 
-        with self._lock:
-            self._pending_futures[callback_id] = fut
+        self._pending_futures[callback_id] = fut
 
         # Build scan args
         args = []

@@ -34,6 +34,8 @@ from glide_shared.routes import (
 
 from ._glide_ffi import _GlideFFI
 from .logger import Level, Logger
+
+from _fast_response import parse_response as _fast_parse_response
 from .sync_commands.cluster_commands import ClusterCommands
 from .sync_commands.cluster_scan_cursor import ClusterScanCursor
 from .sync_commands.core import CoreCommands
@@ -233,16 +235,8 @@ class BaseClient(CoreCommands):
     def _handle_response(self, message):
         if message == self._ffi.NULL:
             raise RequestError("Received NULL message.")
-
-        message_type = self._ffi.typeof(message).cname
-        if message_type == "CommandResponse *":
-            message = message[0]
-            message_type = self._ffi.typeof(message).cname
-
-        if message_type != "CommandResponse":
-            raise RequestError(f"Unexpected message type = {message_type}")
-
-        return self._handle_command_response(message)
+        addr = int(self._ffi.cast("uintptr_t", message))
+        return _fast_parse_response(addr)
 
     def _handle_command_response(self, msg):
         """Handle a CommandResponse message based on its response type."""
