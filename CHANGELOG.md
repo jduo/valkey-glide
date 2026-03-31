@@ -2,6 +2,7 @@
 
 #### Changes
 * CORE: Add OpenTelemetry DB semantic convention attributes to command spans ([#5416](https://github.com/valkey-io/valkey-glide/issues/5416))
+* CORE: Prevent zombie subcommand accumulation with InflightTracker ([#5632](https://github.com/valkey-io/valkey-glide/issues/5632))
 
 ## 2.3.0
 
