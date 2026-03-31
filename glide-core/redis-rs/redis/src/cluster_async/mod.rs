@@ -2703,6 +2703,8 @@ where
         let (address, mut conn) = Self::get_connection(routing, core, Some(cmd.clone()))
             .await
             .map_err(|err| (OperationTarget::NotFound, err))?;
+
+        // Update OTel span with actual routed node address
         if let Some(span) = cmd.span() {
             set_routed_node_on_span(&span, &address);
         }
@@ -2721,6 +2723,8 @@ where
     ) -> OperationResult {
         trace!("try_pipeline_request");
         let (address, mut conn) = conn.await.map_err(|err| (OperationTarget::NotFound, err))?;
+
+        // Update OTel span with actual routed node address
         if let Some(span) = pipeline.span() {
             set_routed_node_on_span(&span, &address);
         }
