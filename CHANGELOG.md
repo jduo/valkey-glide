@@ -1,4 +1,9 @@
-## 2.3
+## 2.3.1
+
+#### Changes
+* CORE: Add OpenTelemetry DB semantic convention attributes to command spans ([#5416](https://github.com/valkey-io/valkey-glide/issues/5416))
+
+## 2.3.0
 
 #### Changes
 * Node: add dynamic PubSub support ([#5295](https://github.com/valkey-io/valkey-glide/pull/5295))
