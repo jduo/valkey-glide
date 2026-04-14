@@ -198,6 +198,100 @@ fn get_jvm_or_complete_error(
     }
 }
 
+/// Build RoutingInfo from JNI route parameters.
+/// Build RoutingInfo from buffer data (no JNI calls needed).
+fn build_routing_from_buffer(
+    route_type: i32,
+    slot_id: i32,
+    slot_type: i32,
+    port: i32,
+    route_param: Option<&[u8]>,
+    cmd: &redis::Cmd,
+) -> Option<redis::cluster_routing::RoutingInfo> {
+    use redis::cluster_routing::*;
+
+    let get_response_policy = || cmd.command().and_then(|c| ResponsePolicy::for_command(&c));
+    let slot_addr = || {
+        if slot_type == 0 {
+            SlotAddr::Master
+        } else {
+            SlotAddr::ReplicaRequired
+        }
+    };
+
+    match route_type {
+        0 => Some(RoutingInfo::MultiNode((
+            MultipleNodeRoutingInfo::AllNodes,
+            get_response_policy(),
+        ))),
+        1 => Some(RoutingInfo::MultiNode((
+            MultipleNodeRoutingInfo::AllMasters,
+            get_response_policy(),
+        ))),
+        2 => Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)),
+        3 => Some(RoutingInfo::SingleNode(
+            SingleNodeRoutingInfo::SpecificNode(Route::new(slot_id as u16, slot_addr())),
+        )),
+        4 => {
+            let key = route_param
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
+            Some(RoutingInfo::SingleNode(
+                SingleNodeRoutingInfo::SpecificNode(Route::new(
+                    redis::cluster_topology::get_slot(key.as_bytes()),
+                    slot_addr(),
+                )),
+            ))
+        }
+        5 => {
+            let host = route_param
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
+            Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
+                host,
+                port: port as u16,
+            }))
+        }
+        _ => None,
+    }
+}
+
+// Internal helper: execute a direct command (no protobuf) and complete Java callback
+async fn execute_direct_command_and_complete(
+    handle_id: u64,
+    mut cmd: redis::Cmd,
+    routing: Option<redis::cluster_routing::RoutingInfo>,
+    callback_id: jlong,
+    jvm: std::sync::Arc<jni::JavaVM>,
+    expect_utf8: bool,
+) {
+    let result: Result<redis::Value, redis::RedisError> = async {
+        let mut client = jni_client::ensure_client_for_handle(handle_id)
+            .await
+            .map_err(|e| {
+                redis::RedisError::from((
+                    redis::ErrorKind::ClientError,
+                    "Client not found",
+                    e.to_string(),
+                ))
+            })?;
+
+        // Apply compression if enabled
+        if client.is_compression_enabled()
+            && let Err(e) = process_command_for_compression(&mut cmd, &client)
+        {
+            log::warn!("Compression processing failed: {e}, continuing with original command");
+        }
+
+        // Use provided routing or default
+        client.send_command(&mut cmd, routing).await
+    }
+    .await;
+
+    let binary_mode = !expect_utf8;
+    jni_client::complete_callback(jvm, callback_id, result, binary_mode);
+}
+
 // Internal helper: execute a parsed CommandRequest and complete Java callback
 async fn execute_command_request_and_complete(
     handle_id: u64,
@@ -473,13 +567,11 @@ fn resp_value_to_java<'local>(
         }
         Value::BulkString(data) => {
             if encoding_utf8 {
-                match String::from_utf8(data) {
-                    Ok(utf8_str) => Ok(JObject::from(env.new_string(utf8_str)?)),
-                    Err(err) => {
-                        let bytes = err.into_bytes();
-                        Ok(JObject::from(env.byte_array_from_slice(&bytes)?))
-                    }
-                }
+                // SAFETY: The user chose UTF-8 mode, asserting the data is valid UTF-8.
+                // Skip the O(n) validation pass from String::from_utf8 — go straight to
+                // JNI new_string which does a single copy into the JVM heap.
+                let utf8_str = unsafe { String::from_utf8_unchecked(data) };
+                Ok(JObject::from(env.new_string(utf8_str)?))
             } else {
                 Ok(JObject::from(env.byte_array_from_slice(&data)?))
             }
@@ -706,8 +798,10 @@ fn array_to_java_array<'local>(
     values: Vec<Value>,
     encoding_utf8: bool,
 ) -> Result<JObject<'local>, FFIError> {
+    let cache = get_java_value_conversion_cache_safe(env)?;
+    let obj_cls = to_local_jclass(env, &cache.object_class)?;
     let items: JObjectArray =
-        env.new_object_array(values.len() as i32, "java/lang/Object", JObject::null())?;
+        env.new_object_array(values.len() as i32, &obj_cls, JObject::null())?;
 
     for (i, item) in values.into_iter().enumerate() {
         let java_value = resp_value_to_java(env, item, encoding_utf8)?;
@@ -1470,6 +1564,136 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
             callback_id,
             jvm,
             true, // executeCommandAsync expects UTF-8 decoding
+        ));
+
+        Some(())
+    })
+    .unwrap_or(())
+}
+
+/// Execute Valkey command from a DirectByteBuffer — zero-copy read of command data.
+/// Buffer format: [requestType:i32][argCount:i32][flags:i32][routeType:i32][slotId:i32]
+///                [slotType:i32][port:i32][routeParamLen:i32][routeParam bytes]
+///                [arg0Len:i32][arg0 bytes][arg1Len:i32][arg1 bytes]...
+/// All integers are little-endian.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandBuffer(
+    mut env: JNIEnv,
+    _class: JClass,
+    client_ptr: jlong,
+    command_buffer: JObject,
+    buffer_length: jint,
+    callback_id: jlong,
+) {
+    run_ffi(|| {
+        let Some(jvm) = get_jvm_or_complete_error(&mut env, callback_id, "executeCommandBuffer")
+        else {
+            return Some(());
+        };
+
+        // Get direct buffer address — zero copy
+        let buf_ptr = match env.get_direct_buffer_address((&command_buffer).into()) {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                complete_callback_with_error_on_caller(
+                    &mut env,
+                    callback_id,
+                    &format!("Failed to get buffer address: {e}"),
+                );
+                return Some(());
+            }
+        };
+
+        let buf_len = buffer_length as usize;
+        let buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
+
+        // Parse header (all little-endian i32)
+        if buf_len < 32 {
+            complete_callback_with_error_on_caller(
+                &mut env,
+                callback_id,
+                "Command buffer too small",
+            );
+            return Some(());
+        }
+
+        let request_type = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let arg_count = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let flags = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let route_type = i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let slot_id = i32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let slot_type = i32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+        let port = i32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
+        let route_param_len = i32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]) as usize;
+
+        let expect_utf8 = (flags & 1) != 0;
+        let mut pos = 32 + route_param_len;
+
+        // Build command
+        let rt: glide_core::request_type::RequestType = protobuf::EnumOrUnknown::<
+            glide_core::command_request::RequestType,
+        >::from_i32(request_type)
+        .into();
+        let Some(mut cmd) = rt.get_command() else {
+            complete_callback_with_error_on_caller(
+                &mut env,
+                callback_id,
+                &format!("Invalid request type: {request_type}"),
+            );
+            return Some(());
+        };
+
+        // Read args directly from buffer — no JNI calls
+        for _ in 0..arg_count {
+            if pos + 4 > buf_len {
+                complete_callback_with_error_on_caller(
+                    &mut env,
+                    callback_id,
+                    "Buffer underflow reading arg length",
+                );
+                return Some(());
+            }
+            let arg_len =
+                i32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+            pos += 4;
+            if pos + arg_len > buf_len {
+                complete_callback_with_error_on_caller(
+                    &mut env,
+                    callback_id,
+                    "Buffer underflow reading arg data",
+                );
+                return Some(());
+            }
+            cmd.arg(&buf[pos..pos + arg_len]);
+            pos += arg_len;
+        }
+
+        // Build routing from buffer
+        let routing = if route_type >= 0 {
+            build_routing_from_buffer(
+                route_type,
+                slot_id,
+                slot_type,
+                port,
+                if route_param_len > 0 {
+                    Some(&buf[32..32 + route_param_len])
+                } else {
+                    None
+                },
+                &cmd,
+            )
+        } else {
+            None
+        };
+
+        let handle_id = client_ptr as u64;
+        get_runtime().spawn(execute_direct_command_and_complete(
+            handle_id,
+            cmd,
+            routing,
+            callback_id,
+            jvm,
+            expect_utf8,
         ));
 
         Some(())
@@ -2365,6 +2589,8 @@ pub struct JavaValueConversionCache {
     big_integer_ctor: JMethodID,
     request_exception_class: GlobalRef,
     request_exception_ctor: JMethodID,
+    /// Cached java.lang.Object class for array creation
+    object_class: GlobalRef,
 }
 
 static JAVA_VALUE_CONVERSION_CACHE: OnceLock<Mutex<Option<JavaValueConversionCache>>> =
@@ -2428,6 +2654,9 @@ fn get_java_value_conversion_cache(
     let req_exc_ctor = env.get_method_id(&req_exc_cls, "<init>", "(Ljava/lang/String;)V")?;
     let request_exception_class = env.new_global_ref(&req_exc_cls)?;
 
+    let obj_cls = env.find_class("java/lang/Object")?;
+    let object_class = env.new_global_ref(&obj_cls)?;
+
     let cache = JavaValueConversionCache {
         long_class,
         long_ctor,
@@ -2448,6 +2677,7 @@ fn get_java_value_conversion_cache(
         big_integer_ctor: bi_ctor,
         request_exception_class,
         request_exception_ctor: req_exc_ctor,
+        object_class,
     };
 
     // Prefer existing value if concurrently initialized

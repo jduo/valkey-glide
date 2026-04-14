@@ -34,6 +34,18 @@ public class GlideNativeBridge {
     public static native void executeBinaryCommandAsync(
             long clientPtr, byte[] requestBytes, long callbackId);
 
+    /**
+     * Execute command using a DirectByteBuffer containing the serialized command. Zero-copy: Rust
+     * reads directly from the buffer's native memory without any JNI array copy.
+     *
+     * @param clientPtr native client handle
+     * @param commandBuffer DirectByteBuffer with serialized command (see CommandBuffer format)
+     * @param bufferLength number of valid bytes in the buffer
+     * @param callbackId correlation ID for async callback
+     */
+    public static native void executeCommandBuffer(
+            long clientPtr, java.nio.ByteBuffer commandBuffer, int bufferLength, long callbackId);
+
     /** Execute batch (pipeline/transaction) asynchronously */
     public static native void executeBatchAsync(
             long clientPtr, byte[] batchRequestBytes, boolean expectUtf8Response, long callbackId);

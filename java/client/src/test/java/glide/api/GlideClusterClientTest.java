@@ -102,8 +102,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
-import response.ResponseOuterClass.ConstantResponse;
-import response.ResponseOuterClass.Response;
 
 public class GlideClusterClientTest {
 
@@ -206,9 +204,7 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void custom_command_returns_single_value_on_constant_response() {
-        CommandManager commandManager =
-                new TestCommandManager(
-                        Response.newBuilder().setConstantResponse(ConstantResponse.OK).build());
+        CommandManager commandManager = new TestCommandManager("OK");
 
         try (TestClient client = new TestClient(commandManager, "OK")) {
             ClusterValue<Object> value = client.customCommand(TEST_ARGS, ALL_NODES).get();
@@ -248,9 +244,7 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void custom_command_binary_returns_single_value_on_constant_response() {
-        CommandManager commandManager =
-                new TestCommandManager(
-                        Response.newBuilder().setConstantResponse(ConstantResponse.OK).build());
+        CommandManager commandManager = new TestCommandManager("OK");
 
         try (TestClient client = new TestClient(commandManager, "OK")) {
             ClusterValue<Object> value = client.customCommand(new GlideString[0], ALL_NODES).get();
@@ -269,7 +263,7 @@ public class GlideClusterClientTest {
 
         @Override
         protected <T> T handleValkeyResponse(
-                Class<T> classType, EnumSet<ResponseFlags> flags, Response response) {
+                Class<T> classType, EnumSet<ResponseFlags> flags, Object value) {
             @SuppressWarnings("unchecked")
             T returnValue = (T) object;
             return returnValue;
@@ -281,17 +275,17 @@ public class GlideClusterClientTest {
 
     private static class TestCommandManager extends CommandManager {
 
-        private final Response response;
+        private final Object response;
 
-        public TestCommandManager(Response responseToReturn) {
+        public TestCommandManager(Object responseToReturn) {
             super(null);
-            response = responseToReturn != null ? responseToReturn : Response.newBuilder().build();
+            response = responseToReturn;
         }
 
         @Override
         protected <T> CompletableFuture<T> submitCommandToJni(
                 CommandRequest.Builder command,
-                GlideExceptionCheckedFunction<Response, T> responseHandler,
+                GlideExceptionCheckedFunction<Object, T> responseHandler,
                 boolean binaryMode) {
             return CompletableFuture.supplyAsync(() -> responseHandler.apply(response));
         }
@@ -299,7 +293,7 @@ public class GlideClusterClientTest {
         @Override
         protected <T> CompletableFuture<T> submitCommandToJni(
                 CommandRequest.Builder command,
-                GlideExceptionCheckedFunction<Response, T> responseHandler,
+                GlideExceptionCheckedFunction<Object, T> responseHandler,
                 boolean binaryMode,
                 boolean expectUtf8Response) {
             return CompletableFuture.supplyAsync(() -> responseHandler.apply(response));

@@ -104,7 +104,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import lombok.NonNull;
-import response.ResponseOuterClass.Response;
 
 /**
  * Client used for connection to cluster servers.<br>
@@ -209,11 +208,11 @@ public class GlideClusterClient extends BaseClient
     }
 
     @SuppressWarnings("unchecked")
-    protected ClusterValue<Object> handleCustomCommandResponse(Route route, Response response) {
+    protected ClusterValue<Object> handleCustomCommandResponse(Route route, Object response) {
         if (route instanceof SingleNodeRoute) {
             return ClusterValue.ofSingleValue(handleObjectOrNullResponse(response));
         }
-        if (response.hasConstantResponse()) {
+        if (OK.equals(response)) {
             return ClusterValue.ofSingleValue(handleStringResponse(response));
         }
         Object data =
@@ -225,11 +224,11 @@ public class GlideClusterClient extends BaseClient
     }
 
     @SuppressWarnings("unchecked")
-    protected ClusterValue<Object> handleCustomCommandBinaryResponse(Route route, Response response) {
+    protected ClusterValue<Object> handleCustomCommandBinaryResponse(Route route, Object response) {
         if (route instanceof SingleNodeRoute) {
             return ClusterValue.ofSingleValue(handleBinaryObjectOrNullResponse(response));
         }
-        if (response.hasConstantResponse()) {
+        if (OK.equals(response)) {
             return ClusterValue.ofSingleValue(handleStringResponse(response));
         }
         Object data = handleValkeyResponse(Object.class, EnumSet.noneOf(ResponseFlags.class), response);
@@ -711,7 +710,7 @@ public class GlideClusterClient extends BaseClient
 
     /** Process a <code>FUNCTION LIST</code> cluster response. */
     protected ClusterValue<Map<String, Object>[]> handleFunctionListResponse(
-            Response response, Route route) {
+            Object response, Route route) {
         if (route instanceof SingleNodeRoute) {
             Map<String, Object>[] data = handleFunctionListResponse(handleArrayResponse(response));
             return ClusterValue.ofSingleValue(data);
@@ -728,7 +727,7 @@ public class GlideClusterClient extends BaseClient
 
     /** Process a <code>FUNCTION LIST</code> cluster response. */
     protected ClusterValue<Map<GlideString, Object>[]> handleFunctionListResponseBinary(
-            Response response, Route route) {
+            Object response, Route route) {
         if (route instanceof SingleNodeRoute) {
             Map<GlideString, Object>[] data =
                     handleFunctionListResponseBinary(handleArrayResponseBinary(response));

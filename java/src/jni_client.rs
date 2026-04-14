@@ -414,7 +414,21 @@ fn process_callback_job_with_env(
 
     match result {
         Ok(server_value) => {
-            let _ = env.push_local_frame(16);
+            // Only push a local reference frame for complex responses (arrays, maps, sets)
+            // that create many JNI local references. Simple responses (Nil, OK, Int, String)
+            // create at most 2-3 refs and don't need the overhead of frame management.
+            let needs_frame = matches!(
+                server_value,
+                redis::Value::Array(_)
+                    | redis::Value::Map(_)
+                    | redis::Value::Set(_)
+                    | redis::Value::Push { .. }
+                    | redis::Value::Attribute { .. }
+            ) || should_use_direct_buffer(&server_value);
+
+            if needs_frame {
+                let _ = env.push_local_frame(16);
+            }
 
             let java_result = if should_use_direct_buffer(&server_value) {
                 create_direct_byte_buffer(env, server_value, !binary_mode)
@@ -423,7 +437,9 @@ fn process_callback_job_with_env(
             };
 
             if take_timed_out_callback(callback_id) {
-                let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+                if needs_frame {
+                    let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+                }
                 return;
             }
 
@@ -448,7 +464,9 @@ fn process_callback_job_with_env(
                     }
                 }
             }
-            let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+            if needs_frame {
+                let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+            }
         }
         Err(server_err) => {
             if take_timed_out_callback(callback_id) {

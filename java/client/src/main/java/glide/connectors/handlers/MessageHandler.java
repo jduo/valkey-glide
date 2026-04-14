@@ -9,7 +9,6 @@ import glide.api.models.GlideString;
 import glide.api.models.PubSubMessage;
 import glide.api.models.configuration.BaseSubscriptionConfiguration.MessageCallback;
 import glide.api.models.exceptions.GlideException;
-import glide.managers.BaseResponseResolver;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Optional;
@@ -18,7 +17,6 @@ import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.stream.Collectors;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
-import response.ResponseOuterClass.Response;
 
 /** Handler for incoming push messages (subscriptions). */
 @Getter
@@ -48,9 +46,6 @@ public class MessageHandler {
     /** An arbitrary user object to be passed to callback. */
     private final Optional<Object> context;
 
-    /** Helper which extracts data from received {@link Response}s from GLIDE. */
-    private final BaseResponseResolver responseResolver;
-
     /** A message queue wrapper. */
     @Getter(
             onMethod_ = {
@@ -60,9 +55,8 @@ public class MessageHandler {
             })
     private final PubSubMessageQueue queue = new PubSubMessageQueue();
 
-    /** Process a push (PUBSUB) message received as a part of {@link Response} from GLIDE. */
-    void handle(Response response) throws MessageCallbackException {
-        Object data = responseResolver.apply(response);
+    /** Process a push (PUBSUB) message received as a direct Java object from GLIDE. */
+    void handle(Object data) throws MessageCallbackException {
         if (!(data instanceof Map)) {
             Logger.log(
                     Logger.Level.WARN,

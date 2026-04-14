@@ -318,11 +318,9 @@ import glide.api.models.configuration.ServerCredentials;
 import glide.api.models.exceptions.ConfigurationError;
 import glide.api.models.exceptions.GlideException;
 import glide.connectors.handlers.MessageHandler;
-import glide.ffi.resolvers.GlideValueResolver;
 import glide.ffi.resolvers.NativeUtils;
 import glide.ffi.resolvers.StatisticsResolver;
 import glide.internal.GlideCoreClient;
-import glide.managers.BaseResponseResolver;
 import glide.managers.CommandManager;
 import glide.managers.ConnectionManager;
 import glide.utils.ArgsBuilder;
@@ -341,8 +339,6 @@ import java.util.stream.Collectors;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
 import org.apache.commons.lang3.ArrayUtils;
-import response.ResponseOuterClass.ConstantResponse;
-import response.ResponseOuterClass.Response;
 
 /** Base Client class */
 public abstract class BaseClient
@@ -362,7 +358,7 @@ public abstract class BaseClient
                 PubSubBaseCommands {
 
     /** Valkey simple string response with "OK" */
-    public static final String OK = ConstantResponse.OK.toString();
+    public static final String OK = "OK";
 
     // Response processing flags
     public enum ResponseFlags {
@@ -403,30 +399,6 @@ public abstract class BaseClient
             throw new RuntimeException("Failed to load native library", e);
         }
     }
-
-    /** Helper which extracts data from received {@link Response}s from GLIDE. */
-    private static final BaseResponseResolver responseResolver =
-            new BaseResponseResolver(
-                    pointer -> {
-                        if (pointer == null || pointer == 0) {
-                            return null;
-                        }
-                        // The pointer is an ID to retrieve the object from the registry
-                        // The object was already converted from Redis Value to Java in the native layer
-                        return GlideValueResolver.valueFromPointer(pointer);
-                    });
-
-    /** Helper which extracts data with binary strings from received {@link Response}s from GLIDE. */
-    private static final BaseResponseResolver binaryResponseResolver =
-            new BaseResponseResolver(
-                    pointer -> {
-                        if (pointer == null || pointer == 0) {
-                            return null;
-                        }
-                        // The pointer is an ID to retrieve the object from the registry
-                        // The object was already converted with binary encoding in the native layer
-                        return GlideValueResolver.valueFromPointerBinary(pointer);
-                    });
 
     /** Constructor for client initialization */
     protected BaseClient(ClientBuilder builder) {
@@ -517,8 +489,7 @@ public abstract class BaseClient
                         : Optional.empty(),
                 config.getSubscriptionConfiguration() != null
                         ? config.getSubscriptionConfiguration().getContext()
-                        : Optional.empty(),
-                responseResolver);
+                        : Optional.empty());
     }
 
     /** Build CommandManager for native client */
@@ -615,10 +586,11 @@ public abstract class BaseClient
     }
 
     /**
-     * Extracts the value from a <code>GLIDE core</code> response message and either throws an
-     * exception or returns the value as an object of type <code>T</code>.
+     * Extracts the value from a <code>GLIDE core</code> response and either throws an exception or
+     * returns the value as an object of type <code>T</code>. The value is already a Java object from
+     * JNI (String, byte[], Object[], Map, Long, Double, Boolean, GlideString, or null) — no protobuf
+     * Response wrapper is involved.
      *
-     * @param response protobuf message.
      * @param classType Parameter <code>T</code> class type.
      * @param flags A set of parameters which describes how to handle the response. Could be empty or
      *     any combination of
@@ -628,17 +600,16 @@ public abstract class BaseClient
      *       <li>{@link ResponseFlags#IS_NULLABLE} to accept <code>null</code> values.
      *     </ul>
      *
+     * @param value The raw Java object from the response pipeline.
      * @return Response as an object of type <code>T</code> or <code>null</code>.
      * @param <T> The return value type.
      * @throws GlideException On a type mismatch.
      */
     @SuppressWarnings("unchecked")
     protected <T> T handleValkeyResponse(
-            Class<T> classType, EnumSet<ResponseFlags> flags, Response response) throws GlideException {
+            Class<T> classType, EnumSet<ResponseFlags> flags, Object value) throws GlideException {
         boolean encodingUtf8 = flags.contains(ResponseFlags.ENCODING_UTF8);
         boolean isNullable = flags.contains(ResponseFlags.IS_NULLABLE);
-        Object value =
-                encodingUtf8 ? responseResolver.apply(response) : binaryResponseResolver.apply(response);
         if (isNullable && (value == null)) {
             return null;
         }
@@ -673,25 +644,25 @@ public abstract class BaseClient
                         + classType.getSimpleName());
     }
 
-    protected Object handleObjectOrNullResponse(Response response) throws GlideException {
+    protected Object handleObjectOrNullResponse(Object response) throws GlideException {
         return handleValkeyResponse(
                 Object.class, EnumSet.of(ResponseFlags.IS_NULLABLE, ResponseFlags.ENCODING_UTF8), response);
     }
 
-    protected Object handleBinaryObjectOrNullResponse(Response response) throws GlideException {
+    protected Object handleBinaryObjectOrNullResponse(Object response) throws GlideException {
         return handleValkeyResponse(Object.class, EnumSet.of(ResponseFlags.IS_NULLABLE), response);
     }
 
-    protected String handleStringResponse(Response response) throws GlideException {
+    protected String handleStringResponse(Object response) throws GlideException {
         return handleValkeyResponse(String.class, EnumSet.of(ResponseFlags.ENCODING_UTF8), response);
     }
 
-    protected String handleStringOrNullResponse(Response response) throws GlideException {
+    protected String handleStringOrNullResponse(Object response) throws GlideException {
         return handleValkeyResponse(
                 String.class, EnumSet.of(ResponseFlags.IS_NULLABLE, ResponseFlags.ENCODING_UTF8), response);
     }
 
-    protected byte[] handleBytesOrNullResponse(Response response) throws GlideException {
+    protected byte[] handleBytesOrNullResponse(Object response) throws GlideException {
         GlideString result =
                 handleValkeyResponse(GlideString.class, EnumSet.of(ResponseFlags.IS_NULLABLE), response);
         if (result == null) return null;
@@ -699,116 +670,115 @@ public abstract class BaseClient
         return result.getBytes();
     }
 
-    protected GlideString handleGlideStringOrNullResponse(Response response) throws GlideException {
+    protected GlideString handleGlideStringOrNullResponse(Object response) throws GlideException {
         return handleValkeyResponse(GlideString.class, EnumSet.of(ResponseFlags.IS_NULLABLE), response);
     }
 
-    protected GlideString handleGlideStringResponse(Response response) throws GlideException {
+    protected GlideString handleGlideStringResponse(Object response) throws GlideException {
         return handleValkeyResponse(GlideString.class, EnumSet.noneOf(ResponseFlags.class), response);
     }
 
-    protected Boolean handleBooleanResponse(Response response) throws GlideException {
+    protected Boolean handleBooleanResponse(Object response) throws GlideException {
         return handleValkeyResponse(Boolean.class, EnumSet.noneOf(ResponseFlags.class), response);
     }
 
-    protected Long handleLongResponse(Response response) throws GlideException {
+    protected Long handleLongResponse(Object response) throws GlideException {
         return handleValkeyResponse(Long.class, EnumSet.noneOf(ResponseFlags.class), response);
     }
 
-    protected Long handleLongOrNullResponse(Response response) throws GlideException {
+    protected Long handleLongOrNullResponse(Object response) throws GlideException {
         return handleValkeyResponse(Long.class, EnumSet.of(ResponseFlags.IS_NULLABLE), response);
     }
 
-    protected Double handleDoubleResponse(Response response) throws GlideException {
+    protected Double handleDoubleResponse(Object response) throws GlideException {
         return handleValkeyResponse(Double.class, EnumSet.noneOf(ResponseFlags.class), response);
     }
 
-    protected Double handleDoubleOrNullResponse(Response response) throws GlideException {
+    protected Double handleDoubleOrNullResponse(Object response) throws GlideException {
         return handleValkeyResponse(Double.class, EnumSet.of(ResponseFlags.IS_NULLABLE), response);
     }
 
-    protected Object[] handleArrayResponse(Response response) throws GlideException {
+    protected Object[] handleArrayResponse(Object response) throws GlideException {
         return handleValkeyResponse(Object[].class, EnumSet.of(ResponseFlags.ENCODING_UTF8), response);
     }
 
-    protected Object[] handleArrayResponseBinary(Response response) throws GlideException {
+    protected Object[] handleArrayResponseBinary(Object response) throws GlideException {
         return handleValkeyResponse(Object[].class, EnumSet.noneOf(ResponseFlags.class), response);
     }
 
-    protected Object[] handleArrayOrNullResponse(Response response) throws GlideException {
+    protected Object[] handleArrayOrNullResponse(Object response) throws GlideException {
         return handleValkeyResponse(
                 Object[].class,
                 EnumSet.of(ResponseFlags.IS_NULLABLE, ResponseFlags.ENCODING_UTF8),
                 response);
     }
 
-    protected Object[] handleArrayOrNullResponseBinary(Response response) throws GlideException {
+    protected Object[] handleArrayOrNullResponseBinary(Object response) throws GlideException {
         return handleValkeyResponse(Object[].class, EnumSet.of(ResponseFlags.IS_NULLABLE), response);
     }
 
     /**
-     * @param response A Protobuf response
+     * @param response The raw response object
      * @return A map of <code>String</code> to <code>V</code>.
      * @param <V> Value type.
      */
     @SuppressWarnings("unchecked") // raw Map cast to Map<String, V>
-    protected <V> Map<String, V> handleMapResponse(Response response) throws GlideException {
+    protected <V> Map<String, V> handleMapResponse(Object response) throws GlideException {
         return handleValkeyResponse(Map.class, EnumSet.of(ResponseFlags.ENCODING_UTF8), response);
     }
 
     /**
      * Get a map and convert {@link Map} keys from <code>byte[]</code> to {@link String}.
      *
-     * @param response A Protobuf response
+     * @param response The raw response object
      * @return A map of <code>GlideString</code> to <code>V</code>.
      * @param <V> Value type.
      */
     @SuppressWarnings("unchecked") // raw Map cast to Map<GlideString, V>
-    protected <V> Map<GlideString, V> handleBinaryStringMapResponse(Response response)
+    protected <V> Map<GlideString, V> handleBinaryStringMapResponse(Object response)
             throws GlideException {
         return handleValkeyResponse(Map.class, EnumSet.noneOf(ResponseFlags.class), response);
     }
 
     /**
-     * @param response A Protobuf response
+     * @param response The raw response object
      * @return A map of <code>String</code> to <code>V</code> or <code>null</code>
      * @param <V> Value type.
      */
     @SuppressWarnings("unchecked") // raw Map cast to Map<String, V>
-    protected <V> Map<String, V> handleMapOrNullResponse(Response response) throws GlideException {
+    protected <V> Map<String, V> handleMapOrNullResponse(Object response) throws GlideException {
         return handleValkeyResponse(
                 Map.class, EnumSet.of(ResponseFlags.IS_NULLABLE, ResponseFlags.ENCODING_UTF8), response);
     }
 
     /**
-     * @param response A Protobuf response
+     * @param response The raw response object
      * @return A map of <code>String</code> to <code>V</code> or <code>null</code>
      * @param <V> Value type.
      */
     @SuppressWarnings("unchecked") // raw Map cast to Map<String, V>
-    protected <V> Map<GlideString, V> handleBinaryStringMapOrNullResponse(Response response)
+    protected <V> Map<GlideString, V> handleBinaryStringMapOrNullResponse(Object response)
             throws GlideException {
         return handleValkeyResponse(Map.class, EnumSet.of(ResponseFlags.IS_NULLABLE), response);
     }
 
     /**
-     * @param response A Protobuf response
+     * @param response The raw response object
      * @return A map of <code>String</code> to <code>String[]</code>
      */
     @SuppressWarnings("unchecked") // raw Map cast to Map<String, Object[]>
-    protected Map<String, String[]> handleMapOfArraysResponse(Response response)
-            throws GlideException {
+    protected Map<String, String[]> handleMapOfArraysResponse(Object response) throws GlideException {
         Map<String, Object[]> mapResponse =
                 handleValkeyResponse(Map.class, EnumSet.of(ResponseFlags.ENCODING_UTF8), response);
         return castMapOfArrays(mapResponse, String.class);
     }
 
     /**
-     * @param response A Protobuf response
+     * @param response The raw response object
      * @return A map of <code>String</code> to <code>GlideString[]</code>
      */
     @SuppressWarnings("unchecked") // raw Map cast to Map<String, Object[]>
-    protected Map<String, GlideString[]> handleBinaryStringMapOfArraysResponse(Response response)
+    protected Map<String, GlideString[]> handleBinaryStringMapOfArraysResponse(Object response)
             throws GlideException {
         Map<String, Object[]> mapResponse =
                 handleValkeyResponse(Map.class, EnumSet.noneOf(ResponseFlags.class), response);
@@ -816,10 +786,10 @@ public abstract class BaseClient
     }
 
     /**
-     * @param response A Protobuf response
+     * @param response The raw response object
      * @return A map of a map of <code>String[][]</code>
      */
-    protected Map<String, Map<String, String[][]>> handleXReadResponse(Response response)
+    protected Map<String, Map<String, String[][]>> handleXReadResponse(Object response)
             throws GlideException {
         Map<String, Object> mapResponse = handleMapOrNullResponse(response);
         if (mapResponse == null) {
@@ -833,11 +803,11 @@ public abstract class BaseClient
     }
 
     /**
-     * @param response A Protobuf response
+     * @param response The raw response object
      * @return A map of a map of <code>GlideString[][]</code>
      */
     protected Map<GlideString, Map<GlideString, GlideString[][]>> handleXReadResponseBinary(
-            Response response) throws GlideException {
+            Object response) throws GlideException {
         Map<GlideString, Object> mapResponse = handleBinaryStringMapOrNullResponse(response);
         if (mapResponse == null) {
             return null;
@@ -852,12 +822,12 @@ public abstract class BaseClient
     }
 
     @SuppressWarnings("unchecked") // raw Set cast to Set<String>
-    protected Set<String> handleSetResponse(Response response) throws GlideException {
+    protected Set<String> handleSetResponse(Object response) throws GlideException {
         return handleValkeyResponse(Set.class, EnumSet.of(ResponseFlags.ENCODING_UTF8), response);
     }
 
     @SuppressWarnings("unchecked")
-    protected Set<GlideString> handleSetBinaryResponse(Response response) throws GlideException {
+    protected Set<GlideString> handleSetBinaryResponse(Object response) throws GlideException {
         return handleValkeyResponse(Set.class, EnumSet.noneOf(ResponseFlags.class), response);
     }
 
@@ -909,7 +879,7 @@ public abstract class BaseClient
 
     /** Process a <code>FUNCTION STATS</code> cluster response. */
     protected ClusterValue<Map<String, Map<String, Object>>> handleFunctionStatsResponse(
-            Response response, boolean isSingleValue) {
+            Object response, boolean isSingleValue) {
         if (isSingleValue) {
             return ClusterValue.ofSingleValue(handleFunctionStatsResponse(handleMapResponse(response)));
         } else {
@@ -923,7 +893,7 @@ public abstract class BaseClient
 
     /** Process a <code>FUNCTION STATS</code> cluster response. */
     protected ClusterValue<Map<GlideString, Map<GlideString, Object>>>
-            handleFunctionStatsBinaryResponse(Response response, boolean isSingleValue) {
+            handleFunctionStatsBinaryResponse(Object response, boolean isSingleValue) {
         if (isSingleValue) {
             return ClusterValue.ofSingleValue(
                     handleFunctionStatsBinaryResponse(handleBinaryStringMapResponse(response)));

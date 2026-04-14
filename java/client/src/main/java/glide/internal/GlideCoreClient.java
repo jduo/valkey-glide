@@ -246,6 +246,47 @@ public class GlideCoreClient implements AutoCloseable {
         return executeCommandAsyncInternal(requestBytes, 0);
     }
 
+    /** Execute command via DirectByteBuffer — zero-copy transfer to Rust. */
+    public CompletableFuture<Object> executeCommandBuffer(java.nio.ByteBuffer buf) {
+        return executeCommandBufferInternal(buf, this.requestTimeoutMillis);
+    }
+
+    /** Execute command via DirectByteBuffer without Java-side timeout (blocking commands). */
+    public CompletableFuture<Object> executeCommandBufferNoTimeout(java.nio.ByteBuffer buf) {
+        return executeCommandBufferInternal(buf, 0);
+    }
+
+    private CompletableFuture<Object> executeCommandBufferInternal(
+            java.nio.ByteBuffer buf, long timeoutMs) {
+        try {
+            long handle = nativeClientHandle.get();
+            if (handle == 0) {
+                CompletableFuture<Object> future = new CompletableFuture<>();
+                future.completeExceptionally(
+                        new glide.api.models.exceptions.ClosingException("Client is closed"));
+                return future;
+            }
+
+            CompletableFuture<Object> future = new CompletableFuture<>();
+            long correlationId;
+            try {
+                correlationId = AsyncRegistry.register(future, this.maxInflightRequests, handle, timeoutMs);
+            } catch (glide.api.models.exceptions.RequestException e) {
+                future.completeExceptionally(e);
+                return future;
+            }
+
+            GlideNativeBridge.executeCommandBuffer(handle, buf, buf.limit(), correlationId);
+
+            return future;
+
+        } catch (Exception e) {
+            CompletableFuture<Object> future = new CompletableFuture<>();
+            future.completeExceptionally(e);
+            return future;
+        }
+    }
+
     private CompletableFuture<Object> executeCommandAsyncInternal(
             byte[] requestBytes, long timeoutMs) {
         try {

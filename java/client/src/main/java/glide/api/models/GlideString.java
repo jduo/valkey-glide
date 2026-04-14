@@ -33,6 +33,11 @@ public class GlideString implements Comparable<GlideString> {
     /** Constructor is private - use {@link #gs} or {@link #of} to instantiate an object. */
     private GlideString() {}
 
+    /** Package-private factory — same as of(byte[]) but named explicitly for internal clarity. */
+    static GlideString ofNoCopy(byte[] bytes) {
+        return of(bytes);
+    }
+
     /** Create a GlideString using a {@link String}. */
     public static GlideString of(String string) {
         GlideString res = new GlideString();
@@ -41,10 +46,14 @@ public class GlideString implements Comparable<GlideString> {
         return res;
     }
 
-    /** Create a GlideString using a byte array. */
+    /**
+     * Create a GlideString using a byte array. Takes ownership of the array — the caller must not
+     * modify it after this call. This is a breaking API change from the previous defensive-copy
+     * behavior, but eliminates unnecessary allocations on the hot path.
+     */
     public static GlideString of(byte[] bytes) {
         GlideString res = new GlideString();
-        res.bytes = bytes.clone();
+        res.bytes = bytes;
         return res;
     }
 
@@ -69,14 +78,19 @@ public class GlideString implements Comparable<GlideString> {
         return GlideString.of(string);
     }
 
-    /** Create a GlideString using a byte array. */
+    /** Create a GlideString using a byte array. Callers from JNI already own the array. */
     public static GlideString gs(byte[] bytes) {
-        return GlideString.of(bytes);
+        return GlideString.ofNoCopy(bytes);
     }
 
-    /** Returns a copy of the underlying byte array to preserve immutability of the stored value. */
+    /**
+     * Returns the underlying byte array directly. The caller must not modify the returned array. This
+     * is a breaking API change from the previous defensive-copy behavior.
+     *
+     * @return the internal byte array (not a copy)
+     */
     public byte[] getBytes() {
-        return bytes.clone();
+        return bytes;
     }
 
     /** Converts stored data to a human-friendly {@link String} if it is possible. */

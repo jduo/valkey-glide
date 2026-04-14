@@ -67,3 +67,9 @@ application {
         applicationDefaultJvmArgs = ['-Djava.library.path=../target/release']
     }
 }
+
+task miniBenchmark(type: JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'glide.benchmarks.MiniBenchmark'
+    jvmArgs = ['-Djava.library.path=../target/release']
+}

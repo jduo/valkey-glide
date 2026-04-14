@@ -11,6 +11,7 @@ import command_request.CommandRequestOuterClass.RequestType;
 import command_request.CommandRequestOuterClass.Routes;
 import command_request.CommandRequestOuterClass.SimpleRoutes;
 import command_request.CommandRequestOuterClass.SlotTypes;
+import glide.api.BaseClient;
 import glide.api.OpenTelemetry;
 import glide.api.models.Batch;
 import glide.api.models.ClusterBatch;
@@ -30,6 +31,7 @@ import glide.api.models.configuration.RequestRoutingConfiguration.SlotKeyRoute;
 import glide.api.models.exceptions.ClosingException;
 import glide.api.models.exceptions.RequestException;
 import glide.ffi.resolvers.OpenTelemetryResolver;
+import glide.internal.CommandBuffer;
 import glide.internal.GlideCoreClient;
 import glide.utils.BufferUtils;
 import glide.utils.Java8Utils;
@@ -43,8 +45,6 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
-import response.ResponseOuterClass.ConstantResponse;
-import response.ResponseOuterClass.Response;
 
 /**
  * CommandManager that submits command requests directly to the Rust glide-core. Handles command
@@ -72,54 +72,6 @@ public class CommandManager {
     /** Core client connection. */
     private final GlideCoreClient coreClient;
 
-    /**
-     * Apply a response handler with cleanup on exception. If the handler throws, the stored object in
-     * JniResponseRegistry is removed to prevent memory leaks.
-     *
-     * @param response the Response to process
-     * @param responseHandler the handler to apply
-     * @return the result from the handler
-     * @throws RuntimeException if the handler throws (after cleanup)
-     */
-    private static <T> T applyHandlerWithCleanup(
-            Response response, GlideExceptionCheckedFunction<Response, T> responseHandler) {
-        long objectId = response.getRespPointer();
-        try {
-            return responseHandler.apply(response);
-        } catch (RuntimeException e) {
-            // Clean up stored object on handler exception to prevent memory leak
-            if (objectId != 0L) {
-                JniResponseRegistry.remove(objectId);
-            }
-            throw e;
-        }
-    }
-
-    /**
-     * Apply a response handler with cleanup on exception, using a pre-computed objectId. If the
-     * handler throws, the stored object in JniResponseRegistry is removed to prevent memory leaks.
-     *
-     * @param response the Response to process
-     * @param objectId the registry ID to clean up on exception (may be 0 if nothing stored)
-     * @param responseHandler the handler to apply
-     * @return the result from the handler
-     * @throws RuntimeException if the handler throws (after cleanup)
-     */
-    private static <T> T applyHandlerWithCleanup(
-            Response response,
-            long objectId,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
-        try {
-            return responseHandler.apply(response);
-        } catch (RuntimeException e) {
-            // Clean up stored object on handler exception to prevent memory leak
-            if (objectId != 0L) {
-                JniResponseRegistry.remove(objectId);
-            }
-            throw e;
-        }
-    }
-
     /** Internal interface for exposing implementation details about a ClusterScanCursor. */
     public interface ClusterScanCursorDetail extends ClusterScanCursor {
         /**
@@ -137,73 +89,64 @@ public class CommandManager {
         String getCursorId();
     }
 
-    /** Build a command and submit it. */
+    /** Build a command and submit it via the direct (non-protobuf) path. */
     public <T> CompletableFuture<T> submitNewCommand(
             RequestType requestType,
             String[] arguments,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
-        CommandRequest.Builder command = prepareCommandRequest(requestType, arguments);
-        return submitCommandToJni(
-                command, responseHandler, false, true); // String arguments -> expect UTF-8 response
+        return submitCommandBuffer(requestType.getNumber(), arguments, true, null, responseHandler);
     }
 
-    /** Build a command and submit it. */
+    /** Build a command and submit it via the direct (non-protobuf) path. */
     public <T> CompletableFuture<T> submitNewCommand(
             RequestType requestType,
             GlideString[] arguments,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
-        CommandRequest.Builder command = prepareCommandRequest(requestType, arguments);
-        return submitCommandToJni(
-                command, responseHandler, true, false); // GlideString arguments -> expect binary response
+        return submitCommandBuffer(requestType.getNumber(), arguments, false, null, responseHandler);
     }
 
-    /** Build a command with explicit response type expectation. */
+    /** Build a command with explicit response type expectation via the direct path. */
     public <T> CompletableFuture<T> submitNewCommandWithResponseType(
             RequestType requestType,
             GlideString[] arguments,
-            GlideExceptionCheckedFunction<Response, T> responseHandler,
+            GlideExceptionCheckedFunction<Object, T> responseHandler,
             boolean expectUtf8Response) {
 
-        CommandRequest.Builder command = prepareCommandRequest(requestType, arguments);
-        return submitCommandToJni(
-                command, responseHandler, true, expectUtf8Response); // Override response expectation
+        return submitCommandBuffer(
+                requestType.getNumber(), arguments, expectUtf8Response, null, responseHandler);
     }
 
-    /** Build a command with route and explicit response type expectation. */
+    /** Build a command with route and explicit response type expectation via direct path. */
     public <T> CompletableFuture<T> submitNewCommandWithResponseType(
             RequestType requestType,
             GlideString[] arguments,
             Route route,
-            GlideExceptionCheckedFunction<Response, T> responseHandler,
+            GlideExceptionCheckedFunction<Object, T> responseHandler,
             boolean expectUtf8Response) {
-        CommandRequest.Builder command = prepareCommandRequest(requestType, arguments, route);
-        return submitCommandToJni(command, responseHandler, true, expectUtf8Response);
+        return submitCommandBuffer(
+                requestType.getNumber(), arguments, expectUtf8Response, route, responseHandler);
     }
 
-    /** Build a command and submit it. */
+    /** Build a command with route and submit it via direct path. */
     public <T> CompletableFuture<T> submitNewCommand(
             RequestType requestType,
             String[] arguments,
             Route route,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
-        CommandRequest.Builder command = prepareCommandRequest(requestType, arguments, route);
-        return submitCommandToJni(
-                command, responseHandler, false, true); // String arguments -> expect UTF-8 response
+        return submitCommandBuffer(requestType.getNumber(), arguments, true, route, responseHandler);
     }
 
-    /** Build a command and submit it. */
+    /** Build a command with route and submit it via direct path. */
     public <T> CompletableFuture<T> submitNewCommand(
             RequestType requestType,
             GlideString[] arguments,
             Route route,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
-        CommandRequest.Builder command = prepareCommandRequest(requestType, arguments, route);
-        return submitCommandToJni(
-                command, responseHandler, true, false); // GlideString arguments -> expect binary response
+        return submitCommandBuffer(requestType.getNumber(), arguments, false, route, responseHandler);
     }
 
     // ==================== BLOCKING COMMAND METHODS ====================
@@ -214,7 +157,7 @@ public class CommandManager {
     public <T> CompletableFuture<T> submitBlockingCommand(
             RequestType requestType,
             String[] arguments,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
         CommandRequest.Builder command = prepareCommandRequest(requestType, arguments);
         return submitBlockingCommandToJni(command, responseHandler, false, true);
@@ -224,7 +167,7 @@ public class CommandManager {
     public <T> CompletableFuture<T> submitBlockingCommand(
             RequestType requestType,
             GlideString[] arguments,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
         CommandRequest.Builder command = prepareCommandRequest(requestType, arguments);
         return submitBlockingCommandToJni(command, responseHandler, true, false);
@@ -235,7 +178,7 @@ public class CommandManager {
             RequestType requestType,
             String[] arguments,
             Route route,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
         CommandRequest.Builder command = prepareCommandRequest(requestType, arguments, route);
         return submitBlockingCommandToJni(command, responseHandler, false, true);
@@ -246,7 +189,7 @@ public class CommandManager {
             RequestType requestType,
             GlideString[] arguments,
             Route route,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
         CommandRequest.Builder command = prepareCommandRequest(requestType, arguments, route);
         return submitBlockingCommandToJni(command, responseHandler, true, false);
@@ -258,7 +201,7 @@ public class CommandManager {
 
     /** Submit a custom command, detecting if it's a blocking command. */
     public <T> CompletableFuture<T> submitCustomCommand(
-            String[] arguments, GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            String[] arguments, GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
         CommandRequest.Builder command = prepareCommandRequest(RequestType.CustomCommand, arguments);
         if (isBlockingCustomCommand(arguments)) {
@@ -269,7 +212,7 @@ public class CommandManager {
 
     /** Submit a custom command with GlideString args, detecting if it's a blocking command. */
     public <T> CompletableFuture<T> submitCustomCommand(
-            GlideString[] arguments, GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideString[] arguments, GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
         CommandRequest.Builder command = prepareCommandRequest(RequestType.CustomCommand, arguments);
         if (isBlockingCustomCommand(arguments)) {
@@ -280,7 +223,7 @@ public class CommandManager {
 
     /** Submit a custom command with route, detecting if it's a blocking command. */
     public <T> CompletableFuture<T> submitCustomCommand(
-            String[] arguments, Route route, GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            String[] arguments, Route route, GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
         CommandRequest.Builder command =
                 prepareCommandRequest(RequestType.CustomCommand, arguments, route);
@@ -294,7 +237,7 @@ public class CommandManager {
     public <T> CompletableFuture<T> submitCustomCommand(
             GlideString[] arguments,
             Route route,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
         CommandRequest.Builder command =
                 prepareCommandRequest(RequestType.CustomCommand, arguments, route);
@@ -322,7 +265,7 @@ public class CommandManager {
 
     /** Specialized path for ObjectEncoding with GlideString args but textual response. */
     public <T> CompletableFuture<T> submitObjectEncoding(
-            GlideString[] arguments, GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideString[] arguments, GlideExceptionCheckedFunction<Object, T> responseHandler) {
         CommandRequest.Builder command = prepareCommandRequest(RequestType.ObjectEncoding, arguments);
         return submitCommandToJni(command, responseHandler, true, true);
     }
@@ -331,7 +274,7 @@ public class CommandManager {
     public <T> CompletableFuture<T> submitObjectEncoding(
             GlideString[] arguments,
             Route route,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
         CommandRequest.Builder command =
                 prepareCommandRequest(RequestType.ObjectEncoding, arguments, route);
         return submitCommandToJni(command, responseHandler, true, true);
@@ -342,7 +285,7 @@ public class CommandManager {
             Batch batch,
             boolean raiseOnError,
             Optional<BatchOptions> options,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
         CommandRequest.Builder command = prepareCommandRequest(batch, raiseOnError, options);
         boolean expectUtf8Response = !batch.isBinaryOutput();
         Integer timeoutOverride = options.map(BaseBatchOptions::getTimeout).orElse(null);
@@ -354,7 +297,7 @@ public class CommandManager {
             Script script,
             List<GlideString> keys,
             List<GlideString> args,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
         if (!coreClient.isConnected()) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
             errorFuture.completeExceptionally(
@@ -380,8 +323,8 @@ public class CommandManager {
                             expectUtf8Response);
 
             return jniFuture
-                    .thenApply(result -> createDirectResponse(result, expectUtf8Response))
-                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
+                    .thenApply(
+                            result -> responseHandler.apply(normalizeJniResult(result, expectUtf8Response)))
                     .exceptionally(this::exceptionHandler);
         } catch (Exception e) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
@@ -395,7 +338,7 @@ public class CommandManager {
             Script script,
             List<GlideString> args,
             Route route,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
         if (!coreClient.isConnected()) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
             errorFuture.completeExceptionally(
@@ -423,8 +366,8 @@ public class CommandManager {
                             expectUtf8Response);
 
             return jniFuture
-                    .thenApply(result -> createDirectResponse(result, expectUtf8Response))
-                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
+                    .thenApply(
+                            result -> responseHandler.apply(normalizeJniResult(result, expectUtf8Response)))
                     .exceptionally(this::exceptionHandler);
         } catch (Exception e) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
@@ -482,7 +425,7 @@ public class CommandManager {
             ClusterBatch batch,
             boolean raiseOnError,
             Optional<ClusterBatchOptions> options,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
         CommandRequest.Builder command = prepareCommandRequest(batch, raiseOnError, options);
         boolean expectUtf8Response = !batch.isBinaryOutput();
         Integer timeoutOverride = options.map(BaseBatchOptions::getTimeout).orElse(null);
@@ -505,7 +448,7 @@ public class CommandManager {
     public <T> CompletableFuture<T> submitClusterScan(
             ClusterScanCursor cursor,
             @NonNull ScanOptions options,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
         return submitClusterScanToJni(cursor, options, responseHandler, true);
     }
 
@@ -513,7 +456,7 @@ public class CommandManager {
     public <T> CompletableFuture<T> submitClusterScanToJni(
             ClusterScanCursor cursor,
             @NonNull ScanOptions options,
-            GlideExceptionCheckedFunction<Response, T> responseHandler,
+            GlideExceptionCheckedFunction<Object, T> responseHandler,
             boolean expectUtf8Response) {
 
         if (!coreClient.isConnected()) {
@@ -544,8 +487,6 @@ public class CommandManager {
                             cursorId, matchPattern, count != null ? count : 0L, objectType, expectUtf8Response)
                     .thenApply(
                             result -> {
-                                // Create a minimal Response for compatibility with the handler
-                                Response.Builder builder = Response.newBuilder();
                                 Object normalized;
                                 if (result == null) {
                                     normalized =
@@ -559,27 +500,19 @@ public class CommandManager {
                                     // items decode as String (UTF-8) or GlideString (binary)
                                     normalized = normalizeScanResult(result, expectUtf8Response);
                                 }
-                                long objectId = JniResponseRegistry.storeObject(normalized);
-                                builder.setRespPointer(objectId);
-                                try {
-                                    T out = responseHandler.apply(builder.build());
-                                    if (out == null) {
-                                        @SuppressWarnings("unchecked")
-                                        T fallback =
-                                                (T)
-                                                        new Object[] {
-                                                            glide.ffi.resolvers.ClusterScanCursorResolver
-                                                                    .getFinishedCursorHandleConstant(),
-                                                            new Object[0]
-                                                        };
-                                        return fallback;
-                                    }
-                                    return out;
-                                } catch (RuntimeException e) {
-                                    // Clean up stored object on handler exception to prevent memory leak
-                                    JniResponseRegistry.remove(objectId);
-                                    throw e;
+                                T out = responseHandler.apply(normalized);
+                                if (out == null) {
+                                    @SuppressWarnings("unchecked")
+                                    T fallback =
+                                            (T)
+                                                    new Object[] {
+                                                        glide.ffi.resolvers.ClusterScanCursorResolver
+                                                                .getFinishedCursorHandleConstant(),
+                                                        new Object[0]
+                                                    };
+                                    return fallback;
                                 }
+                                return out;
                             })
                     .exceptionally(this::exceptionHandler);
         } catch (Exception e) {
@@ -637,42 +570,34 @@ public class CommandManager {
     public <T> CompletableFuture<T> submitPasswordUpdate(
             Optional<String> password,
             boolean immediateAuth,
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
         return coreClient
                 .updateConnectionPassword(password.orElse(null), immediateAuth)
                 .thenApply(
                         result -> {
-                            // Convert JNI result to protobuf Response format
-                            Response.Builder responseBuilder = Response.newBuilder();
-                            if ("OK".equals(result)) {
-                                responseBuilder.setConstantResponse(ConstantResponse.OK);
-                            }
-                            return responseHandler.apply(responseBuilder.build());
+                            Object normalized = "OK".equals(result) ? BaseClient.OK : result;
+                            return responseHandler.apply(normalized);
                         });
     }
 
     /** Submit an IAM token refresh request to GLIDE core. */
     public <T> CompletableFuture<T> submitRefreshIamToken(
-            GlideExceptionCheckedFunction<Response, T> responseHandler) {
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
 
         return coreClient
                 .refreshIamToken()
                 .thenApply(
                         result -> {
-                            // Convert JNI result to protobuf Response format
-                            Response.Builder responseBuilder = Response.newBuilder();
-                            if ("OK".equals(result)) {
-                                responseBuilder.setConstantResponse(ConstantResponse.OK);
-                            }
-                            return responseHandler.apply(responseBuilder.build());
+                            Object normalized = "OK".equals(result) ? BaseClient.OK : result;
+                            return responseHandler.apply(normalized);
                         });
     }
 
     /** Take a command request and submit it (backward compatibility). */
     protected <T> CompletableFuture<T> submitCommandToJni(
             CommandRequest.Builder command,
-            GlideExceptionCheckedFunction<Response, T> responseHandler,
+            GlideExceptionCheckedFunction<Object, T> responseHandler,
             boolean binaryMode) {
         // For backward compatibility, default expectUtf8Response based on binaryMode
         // binaryMode=true means GlideString args, expect binary response
@@ -683,7 +608,7 @@ public class CommandManager {
     /** Take a command request and submit it. */
     protected <T> CompletableFuture<T> submitCommandToJni(
             CommandRequest.Builder command,
-            GlideExceptionCheckedFunction<Response, T> responseHandler,
+            GlideExceptionCheckedFunction<Object, T> responseHandler,
             boolean binaryMode,
             boolean expectUtf8Response) {
 
@@ -707,8 +632,8 @@ public class CommandManager {
                             : coreClient.executeBinaryCommandAsync(requestBytes); // Allow binary conversion
 
             return jniFuture
-                    .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
-                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
+                    .thenApply(
+                            result -> responseHandler.apply(normalizeJniResult(result, expectUtf8Response)))
                     .exceptionally(this::exceptionHandler);
         } catch (Exception e) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
@@ -723,7 +648,7 @@ public class CommandManager {
      */
     protected <T> CompletableFuture<T> submitBlockingCommandToJni(
             CommandRequest.Builder command,
-            GlideExceptionCheckedFunction<Response, T> responseHandler,
+            GlideExceptionCheckedFunction<Object, T> responseHandler,
             boolean binaryMode,
             boolean expectUtf8Response) {
 
@@ -745,8 +670,70 @@ public class CommandManager {
                             : coreClient.executeBinaryCommandAsyncNoTimeout(requestBytes);
 
             return jniFuture
-                    .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
-                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
+                    .thenApply(
+                            result -> responseHandler.apply(normalizeJniResult(result, expectUtf8Response)))
+                    .exceptionally(this::exceptionHandler);
+        } catch (Exception e) {
+            CompletableFuture<T> errorFuture = new CompletableFuture<T>();
+            errorFuture.completeExceptionally(e);
+            return errorFuture;
+        }
+    }
+
+    /** Submit a command via DirectByteBuffer with String args — writes directly to buffer. */
+    private <T> CompletableFuture<T> submitCommandBuffer(
+            int requestType,
+            String[] args,
+            boolean expectUtf8Response,
+            Route route,
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
+
+        if (!coreClient.isConnected()) {
+            CompletableFuture<T> errorFuture = new CompletableFuture<T>();
+            errorFuture.completeExceptionally(
+                    new ClosingException("Client closed: Unable to submit command."));
+            return errorFuture;
+        }
+
+        try {
+            java.nio.ByteBuffer buf =
+                    CommandBuffer.serialize(requestType, args, expectUtf8Response, route);
+            CompletableFuture<Object> jniFuture = coreClient.executeCommandBuffer(buf);
+
+            return jniFuture
+                    .thenApply(
+                            result -> responseHandler.apply(normalizeJniResult(result, expectUtf8Response)))
+                    .exceptionally(this::exceptionHandler);
+        } catch (Exception e) {
+            CompletableFuture<T> errorFuture = new CompletableFuture<T>();
+            errorFuture.completeExceptionally(e);
+            return errorFuture;
+        }
+    }
+
+    /** Submit a command via DirectByteBuffer with GlideString args — writes directly to buffer. */
+    private <T> CompletableFuture<T> submitCommandBuffer(
+            int requestType,
+            GlideString[] args,
+            boolean expectUtf8Response,
+            Route route,
+            GlideExceptionCheckedFunction<Object, T> responseHandler) {
+
+        if (!coreClient.isConnected()) {
+            CompletableFuture<T> errorFuture = new CompletableFuture<T>();
+            errorFuture.completeExceptionally(
+                    new ClosingException("Client closed: Unable to submit command."));
+            return errorFuture;
+        }
+
+        try {
+            java.nio.ByteBuffer buf =
+                    CommandBuffer.serialize(requestType, args, expectUtf8Response, route);
+            CompletableFuture<Object> jniFuture = coreClient.executeCommandBuffer(buf);
+
+            return jniFuture
+                    .thenApply(
+                            result -> responseHandler.apply(normalizeJniResult(result, expectUtf8Response)))
                     .exceptionally(this::exceptionHandler);
         } catch (Exception e) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
@@ -756,27 +743,24 @@ public class CommandManager {
     }
 
     /**
-     * Build a Response from JNI result, storing the result in JniResponseRegistry if needed.
+     * Normalize a JNI result into a direct Java object. Handles null, "OK" string, ByteBuffer
+     * deserialization, and passes through all other objects directly.
      *
      * @param result the raw result from JNI
      * @param expectUtf8Response whether to expect UTF-8 encoded response
-     * @return the built Response
+     * @return the normalized Java object (String, GlideString, Object[], Map, Long, etc.) or null
      */
-    private Response buildResponseFromJniResult(Object result, boolean expectUtf8Response) {
-        Response.Builder builder = Response.newBuilder();
-        Object toStore = result;
+    private Object normalizeJniResult(Object result, boolean expectUtf8Response) {
         if (result == null) {
-            builder.setRespPointer(0L);
-        } else if ("OK".equals(result)) {
-            builder.setConstantResponse(ConstantResponse.OK);
-        } else {
-            if (result instanceof ByteBuffer) {
-                toStore = normalizeDirectBuffer((ByteBuffer) result, expectUtf8Response);
-            }
-            long objectId = JniResponseRegistry.storeObject(toStore);
-            builder.setRespPointer(objectId);
+            return null;
         }
-        return builder.build();
+        if ("OK".equals(result)) {
+            return BaseClient.OK;
+        }
+        if (result instanceof ByteBuffer) {
+            return normalizeDirectBuffer((ByteBuffer) result, expectUtf8Response);
+        }
+        return result;
     }
 
     private Object normalizeDirectBuffer(ByteBuffer buffer, boolean expectUtf8Response) {
@@ -923,7 +907,7 @@ public class CommandManager {
     /** Submit batch request via JNI. */
     protected <T> CompletableFuture<T> submitBatchToJni(
             CommandRequest.Builder command,
-            GlideExceptionCheckedFunction<Response, T> responseHandler,
+            GlideExceptionCheckedFunction<Object, T> responseHandler,
             boolean expectUtf8Response,
             Integer timeoutOverrideMs) {
 
@@ -938,13 +922,11 @@ public class CommandManager {
             // Serialize the protobuf batch request
             byte[] requestBytes = command.build().toByteArray();
 
-            // Execute via JNI and convert response
-            // Stage 1: Convert JNI result to Response
-            // Stage 2: Apply response handler with cleanup on exception
+            // Execute via JNI and normalize result directly
             return coreClient
                     .executeBatchAsync(requestBytes, expectUtf8Response, timeoutOverrideMs)
-                    .thenApply(result -> convertJniToProtobufResponse(result, expectUtf8Response))
-                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
+                    .thenApply(
+                            result -> responseHandler.apply(normalizeJniResult(result, expectUtf8Response)))
                     .exceptionally(this::exceptionHandler);
         } catch (Exception e) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
@@ -966,110 +948,6 @@ public class CommandManager {
 
         // This shouldn't happen if isFinished() is true
         return null;
-    }
-
-    /**
-     * Convert JNI result to protobuf Response format. This bridges the gap between JNI responses and
-     * the expected protobuf Response.
-     */
-    private Response convertJniToProtobufResponse(Object jniResult, boolean expectUtf8Response) {
-        Response.Builder builder = Response.newBuilder();
-
-        if (jniResult == null) {
-            // Null response - set pointer to 0
-            builder.setRespPointer(0L);
-        } else if ("OK".equals(jniResult)) {
-            // OK constant response
-            builder.setConstantResponse(ConstantResponse.OK);
-        } else if (jniResult instanceof ByteBuffer) {
-            // DirectByteBuffer from JNI. Could be a serialized array/map or a large bulk string.
-            ByteBuffer buffer = (ByteBuffer) jniResult;
-            ByteBuffer dup = buffer.duplicate();
-            dup.rewind();
-            Object toStore;
-            if (dup.remaining() > 0) {
-                byte marker = dup.get();
-                if (marker == '*') {
-                    dup.rewind();
-                    toStore = deserializeByteBufferArray(dup, expectUtf8Response);
-                } else if (marker == '%') {
-                    dup.rewind();
-                    toStore = deserializeByteBufferMap(dup, expectUtf8Response);
-                } else {
-                    dup.rewind();
-                    if (expectUtf8Response) {
-                        toStore = BufferUtils.decodeUtf8(dup);
-                    } else {
-                        byte[] bytes = new byte[dup.remaining()];
-                        dup.get(bytes);
-                        toStore = glide.api.models.GlideString.gs(bytes);
-                    }
-                }
-            } else {
-                toStore = expectUtf8Response ? "" : glide.api.models.GlideString.gs(new byte[0]);
-            }
-            long objectId = JniResponseRegistry.storeObject(toStore);
-            builder.setRespPointer(objectId);
-        } else {
-            // Store the object in the registry and get its ID
-            // This allows BaseResponseResolver to retrieve it correctly
-            long objectId = JniResponseRegistry.storeObject(jniResult);
-            builder.setRespPointer(objectId);
-        }
-
-        return builder.build();
-    }
-
-    /**
-     * Create a direct Response from a JNI result object. Since JNI now returns converted Java objects
-     * directly (not pointers), we store the object in a temporary registry and pass an ID.
-     */
-    private Response createDirectResponse(Object jniResult, boolean expectUtf8Response) {
-        Response.Builder builder = Response.newBuilder();
-
-        if (jniResult == null) {
-            // Null response - no pointer needed
-            builder.setRespPointer(0L);
-        } else if ("OK".equals(jniResult)) {
-            // OK constant response
-            builder.setConstantResponse(ConstantResponse.OK);
-        } else if (jniResult instanceof ByteBuffer) {
-            // DirectByteBuffer from JNI. Could be serialized array/map or large bulk string.
-            ByteBuffer buffer = (ByteBuffer) jniResult;
-            ByteBuffer dup = buffer.duplicate();
-            dup.rewind();
-            Object toStore;
-            if (dup.remaining() > 0) {
-                byte marker = dup.get();
-                if (marker == '*') {
-                    dup.rewind();
-                    toStore = deserializeByteBufferArray(dup, expectUtf8Response);
-                } else if (marker == '%') {
-                    dup.rewind();
-                    toStore = deserializeByteBufferMap(dup, expectUtf8Response);
-                } else {
-                    dup.rewind();
-                    if (expectUtf8Response) {
-                        toStore = BufferUtils.decodeUtf8(dup);
-                    } else {
-                        byte[] bytes = new byte[dup.remaining()];
-                        dup.get(bytes);
-                        toStore = glide.api.models.GlideString.gs(bytes);
-                    }
-                }
-            } else {
-                toStore = expectUtf8Response ? "" : glide.api.models.GlideString.gs(new byte[0]);
-            }
-            long objectId = JniResponseRegistry.storeObject(toStore);
-            builder.setRespPointer(objectId);
-        } else {
-            // Store the Java object and get an ID for it
-            // This ID will be used to retrieve the object in valueFromPointer
-            long objectId = JniResponseRegistry.storeObject(jniResult);
-            builder.setRespPointer(objectId);
-        }
-
-        return builder.build();
     }
 
     /**
