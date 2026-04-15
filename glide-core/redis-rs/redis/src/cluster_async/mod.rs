@@ -51,6 +51,7 @@ use pipeline_routing::{
     route_for_pipeline, PipelineResponses, ResponsePoliciesMap,
 };
 
+use logger_core::log_warn_rate_limited;
 use logger_core::{log_debug_lazy, log_error_lazy, log_info_lazy, log_trace_lazy, log_warn_lazy};
 use rand::seq::IteratorRandom;
 
@@ -3286,8 +3287,9 @@ where
         let (address, mut conn) = match conn_check {
             ConnectionCheck::Found((address, connection)) => (address, connection.await),
             ConnectionCheck::OnlyAddress(address) => {
-                log_warn_lazy!(
+                log_warn_rate_limited!(
                     "moved_error",
+                    10,
                     format!(
                         "get_connection: MOVED redirect to address not in connection map: {}",
                         address
