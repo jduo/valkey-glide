@@ -3388,7 +3388,10 @@ where
                 match handle.now_or_never() {
                     Some(Ok(Ok(()))) => {
                         // Task succeeded
-                        log_trace_lazy!("cluster", "Slot refresh completed successfully!");
+                        log_info_lazy!(
+                            "cluster",
+                            "Recovery complete: Slot refresh succeeded, returning to PollComplete"
+                        );
                         self.state = ConnectionState::PollComplete;
                         return Poll::Ready(Ok(()));
                     }
@@ -3768,6 +3771,35 @@ where
             std::sync::atomic::AtomicU64::new(0);
         static LAST_POLL_FLUSH_LOG: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
+        // Periodic health snapshot: 5min when healthy, 10s during recovery
+        static LAST_HEALTH_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let last_health = LAST_HEALTH_LOG.load(std::sync::atomic::Ordering::Relaxed);
+            let interval = match self.state {
+                ConnectionState::PollComplete => 300, // 5 minutes when healthy
+                ConnectionState::Recover(_) => 10,    // 10 seconds during recovery
+            };
+            if now_secs > last_health + interval {
+                LAST_HEALTH_LOG.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                let in_flight = self.in_flight_requests.len();
+                let node_count = self.inner.conn_lock.read().len();
+                let msg = format!(
+                    "Health: state={:?}, in_flight_requests={}, nodes={}, poll_flush_loops={}",
+                    self.state,
+                    in_flight,
+                    node_count,
+                    POLL_FLUSH_LOOPS.load(std::sync::atomic::Ordering::Relaxed)
+                );
+                match self.state {
+                    ConnectionState::Recover(_) => log_info_lazy!("cluster", msg),
+                    ConnectionState::PollComplete => log_debug_lazy!("cluster", msg),
+                }
+            }
+        }
         let mut loop_iterations: u32 = 0;
         loop {
             loop_iterations += 1;
@@ -3807,6 +3839,13 @@ where
             match ready!(self.poll_complete(cx)) {
                 PollFlushAction::None => return Poll::Ready(Ok(())),
                 PollFlushAction::RebuildSlots => {
+                    log_info_lazy!(
+                        "cluster",
+                        format!(
+                            "Entering recovery: RebuildSlots. in_flight_requests={}",
+                            self.in_flight_requests.len()
+                        )
+                    );
                     // Spawn refresh task
                     let task_handle = ClusterConnInner::spawn_refresh_slots_task(
                         self.inner.clone(),
@@ -3818,6 +3857,13 @@ where
                         ConnectionState::Recover(RecoverFuture::RefreshingSlots(task_handle));
                 }
                 PollFlushAction::ReconnectFromInitialConnections => {
+                    log_info_lazy!(
+                        "cluster",
+                        format!(
+                        "Entering recovery: ReconnectFromInitialConnections. in_flight_requests={}",
+                        self.in_flight_requests.len()
+                    )
+                    );
                     let inner = self.inner.clone();
                     let handle = tokio::spawn(async move {
                         ClusterConnInner::reconnect_to_initial_nodes(inner).await
@@ -3826,6 +3872,14 @@ where
                         ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(handle));
                 }
                 PollFlushAction::Reconnect(addresses) => {
+                    log_info_lazy!(
+                        "cluster",
+                        format!(
+                            "Entering recovery: Reconnect to {:?}. in_flight_requests={}",
+                            addresses,
+                            self.in_flight_requests.len()
+                        )
+                    );
                     let inner = self.inner.clone();
                     let handle = tokio::spawn(async move {
                         ClusterConnInner::trigger_refresh_connection_tasks(
