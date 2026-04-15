@@ -1,6 +1,7 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.internal;
 
+import glide.api.logging.Logger;
 import glide.api.models.exceptions.ClosingException;
 import glide.api.models.exceptions.ExecAbortException;
 import glide.api.models.exceptions.RequestException;
@@ -50,6 +51,13 @@ public final class AsyncRegistry {
 
     /** Thread-safe ID generator for correlation IDs. */
     private static final AtomicLong nextId = new AtomicLong(1);
+
+    /**
+     * Registration timestamps for measuring elapsed time on errors. Maps correlation ID to
+     * System.nanoTime().
+     */
+    private static final ConcurrentHashMap<Long, Long> registrationTimestamps =
+            new ConcurrentHashMap<>();
 
     /**
      * Shutdown flag to prevent race conditions between register() and shutdown()/failAllWithError().
@@ -143,6 +151,7 @@ public final class AsyncRegistry {
 
         // Store original future for completion by native code
         activeFutures.put(correlationId, originalFuture);
+        registrationTimestamps.put(correlationId, System.nanoTime());
 
         // Double-check shutdown flag after insertion to handle race with shutdown()
         // If shutdown started between our first check and the put(), clean up and fail
@@ -193,6 +202,19 @@ public final class AsyncRegistry {
                         () -> {
                             timeoutTasks.remove(correlationId);
                             if (future.completeExceptionally(new TimeoutException("Request timed out"))) {
+                                Long registeredAt = registrationTimestamps.get(correlationId);
+                                long elapsedMs =
+                                        registeredAt != null
+                                                ? (System.nanoTime() - registeredAt) / 1_000_000
+                                                : timeoutMillis;
+                                Logger.log(
+                                        Logger.Level.WARN,
+                                        "AsyncRegistry",
+                                        "Java-side timeout fired after "
+                                                + elapsedMs
+                                                + "ms (configured="
+                                                + timeoutMillis
+                                                + "ms)");
                                 GlideNativeBridge.markTimedOut(correlationId);
                             }
                         },
@@ -214,6 +236,7 @@ public final class AsyncRegistry {
                 (result, error) -> {
                     // Atomic cleanup - no race conditions
                     activeFutures.remove(correlationId);
+                    registrationTimestamps.remove(correlationId);
 
                     // Cancel the timeout task if it hasn't fired yet
                     // Using cancel(false) to avoid interrupting the scheduler thread
@@ -278,6 +301,19 @@ public final class AsyncRegistry {
                         ? "Unknown error from native code"
                         : errorMessage;
 
+        // Log elapsed time for timeout and disconnect errors to help diagnose delays
+        if (errorTypeCode == 2 || errorTypeCode == 3) {
+            Long registeredAt = registrationTimestamps.get(correlationId);
+            if (registeredAt != null) {
+                long elapsedMs = (System.nanoTime() - registeredAt) / 1_000_000;
+                String errorTypeName = errorTypeCode == 2 ? "Timeout" : "Disconnect";
+                Logger.log(
+                        Logger.Level.WARN,
+                        "AsyncRegistry",
+                        errorTypeName + " after " + elapsedMs + "ms: " + msg);
+            }
+        }
+
         RuntimeException ex;
         switch (errorTypeCode) {
             case 2:
@@ -316,6 +352,7 @@ public final class AsyncRegistry {
         activeFutures.values().forEach(future -> future.cancel(true));
         activeFutures.clear();
         clientInflightCounts.clear();
+        registrationTimestamps.clear();
 
         // Shutdown the timeout scheduler
         timeoutScheduler.shutdownNow();
@@ -343,6 +380,7 @@ public final class AsyncRegistry {
         timeoutTasks.values().forEach(task -> task.cancel(false));
         timeoutTasks.clear();
         clientInflightCounts.clear();
+        registrationTimestamps.clear();
     }
 
     /** Clean up per-client tracking when a client is closed. */
@@ -360,6 +398,7 @@ public final class AsyncRegistry {
         timeoutTasks.clear();
         activeFutures.clear();
         clientInflightCounts.clear();
+        registrationTimestamps.clear();
         nextId.set(1);
     }
 
