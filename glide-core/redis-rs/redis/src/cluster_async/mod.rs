@@ -3450,7 +3450,9 @@ where
                     }
                     None => {
                         // Task is still running
-                        // Just continue and return Ok to not block poll_flush
+                        // WARNING: now_or_never() does not register a waker, and returning
+                        // Ready(Ok(())) feeds the loop{} in poll_flush causing busy-spin (#5715)
+                        log_debug_lazy!("cluster", "poll_recover: RefreshingSlots task still running (now_or_never returned None, no waker registered)");
                     }
                 }
 
@@ -3761,7 +3763,32 @@ where
         cx: &mut task::Context,
     ) -> Poll<Result<(), Self::Error>> {
         log_trace_lazy!("cluster", format!("poll_flush: {:?}", self.state));
+        // Track poll_flush loop iterations to detect busy-spin (issue #5715)
+        static POLL_FLUSH_LOOPS: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        static LAST_POLL_FLUSH_LOG: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let mut loop_iterations: u32 = 0;
         loop {
+            loop_iterations += 1;
+            if loop_iterations > 100 {
+                let total = POLL_FLUSH_LOOPS
+                    .fetch_add(loop_iterations as u64, std::sync::atomic::Ordering::Relaxed)
+                    + loop_iterations as u64;
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let last_log = LAST_POLL_FLUSH_LOG.load(std::sync::atomic::Ordering::Relaxed);
+                if now_secs > last_log + 5 {
+                    LAST_POLL_FLUSH_LOG.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                    log_warn_lazy!("cluster", format!(
+                        "poll_flush busy-spin detected: {} iterations this call, {} total since start. state={:?}",
+                        loop_iterations, total, self.state
+                    ));
+                }
+                loop_iterations = 0;
+            }
             self.send_refresh_error();
 
             if let Err(err) = ready!(self.as_mut().poll_recover(cx)) {
