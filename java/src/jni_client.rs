@@ -409,6 +409,13 @@ fn process_callback_job_with_env(
     binary_mode: bool,
 ) {
     if take_timed_out_callback(callback_id) {
+        logger_core::log_warn(
+            "jni_callback",
+            format!(
+                "Rust task completed for callback_id={} but Java already timed out. Task was leaked.",
+                callback_id
+            ),
+        );
         return;
     }
 

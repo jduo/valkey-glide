@@ -249,7 +249,15 @@ async fn execute_command_request_and_complete(
                     None
                 };
 
+                let send_start = std::time::Instant::now();
                 let exec = client.send_command(&mut cmd, routing).await;
+                let send_elapsed = send_start.elapsed();
+                if send_elapsed > std::time::Duration::from_secs(1) {
+                    logger_core::log_warn(
+                        "jni_command",
+                        format!("send_command took {:?} for callback_id={}", send_elapsed, callback_id),
+                    );
+                }
 
                 if let Some(root_span_ptr) = root_span_ptr_opt
                     && root_span_ptr != 0

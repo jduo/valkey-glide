@@ -939,6 +939,14 @@ impl Client {
             let tracker = match self.reserve_inflight_request() {
                 Some(t) => t,
                 None => {
+                    let available = self.inflight_requests_allowed.load(Ordering::Relaxed);
+                    log_warn(
+                        "inflight",
+                        format!(
+                            "Inflight request limit exhausted. limit={}, available={}",
+                            self.inflight_requests_limit, available
+                        ),
+                    );
                     return Err(RedisError::from((
                         ErrorKind::ClientError,
                         "Reached maximum inflight requests",

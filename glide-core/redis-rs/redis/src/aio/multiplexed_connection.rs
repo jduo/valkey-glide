@@ -521,6 +521,7 @@ where
     ) -> Result<Value, RedisError> {
         let (sender, receiver) = oneshot::channel();
 
+        let send_start = std::time::Instant::now();
         self.sender
             .send(PipelineMessage {
                 input,
@@ -540,7 +541,29 @@ where
                     err.to_string(),
                 ))
             })?;
-        match Runtime::locate().timeout(timeout, receiver).await {
+        let send_elapsed = send_start.elapsed();
+        if send_elapsed > std::time::Duration::from_millis(500) {
+            logger_core::log_warn(
+                "pipeline",
+                format!(
+                    "pipeline.send() blocked for {:?} (channel capacity=50)",
+                    send_elapsed
+                ),
+            );
+        }
+        let recv_start = std::time::Instant::now();
+        let recv_result = Runtime::locate().timeout(timeout, receiver).await;
+        let recv_elapsed = recv_start.elapsed();
+        if recv_elapsed > std::time::Duration::from_secs(5) {
+            logger_core::log_warn(
+                "pipeline",
+                format!(
+                    "Response wait took {:?} (timeout={:?})",
+                    recv_elapsed, timeout
+                ),
+            );
+        }
+        match recv_result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
                 // The `sender` was dropped, likely indicating a failure in the stream.
