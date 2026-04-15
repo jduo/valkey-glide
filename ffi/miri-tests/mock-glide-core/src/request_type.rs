@@ -8,6 +8,9 @@ pub enum RequestType {
     /// Invalid request type
     InvalidRequest = 0,
 
+    /// Custom command
+    CustomCommand = 1,
+
     // Basic string commands for testing
     Get = 1504,
     Set = 1517,
@@ -28,6 +31,13 @@ pub enum RequestType {
     // Other common commands
     Expire = 405,
     TTL = 428,
+
+    // Compression-related commands
+    MSet = 1514,
+    MSetNX = 1515,
+    PSetEx = 1516,
+    SetEx = 1518,
+    SetNX = 1519,
 }
 
 impl RequestType {

@@ -1,3 +1,4 @@
+extern crate libc;
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use glide_core::ConnectionRequest;
@@ -36,6 +37,7 @@ use std::slice::from_raw_parts;
 use std::str;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::{Condvar, OnceLock};
 use std::{
     ffi::{CString, c_void},
     mem,
@@ -459,9 +461,130 @@ pub enum ClientType {
     SyncClient,
 }
 
+const FRAME_SIZE: usize = 32;
+struct SharedPipeWriter {
+    buffer: std::sync::Mutex<Vec<u8>>,
+    condvar: Condvar,
+    /// Kept for potential future use (e.g. graceful shutdown via close(pipe_fd)).
+    #[allow(dead_code)]
+    pipe_fd: i32,
+}
+static SHARED_PIPE: OnceLock<SharedPipeWriter> = OnceLock::new();
+impl SharedPipeWriter {
+    fn push_success(&self, cid: u64, rid: usize, rp: usize, ap: usize) {
+        let mut b = self.buffer.lock().unwrap();
+        b.extend_from_slice(&cid.to_ne_bytes());
+        b.extend_from_slice(&(rid as u64).to_ne_bytes());
+        b.extend_from_slice(&(rp as u64).to_ne_bytes());
+        b.extend_from_slice(&(ap as u64).to_ne_bytes());
+        drop(b);
+        self.condvar.notify_one();
+    }
+    fn push_error(&self, cid: u64, rid: usize, et: RequestErrorType, em: String) {
+        let cs = CString::new(em).unwrap_or_else(|_| CString::new("unknown error").unwrap());
+        let p = CString::into_raw(cs) as u64;
+        let pk = ((et as u64) << 56) | (p & 0x00FFFFFFFFFFFFFF);
+        let mut b = self.buffer.lock().unwrap();
+        b.extend_from_slice(&cid.to_ne_bytes());
+        b.extend_from_slice(&(rid as u64).to_ne_bytes());
+        b.extend_from_slice(&0u64.to_ne_bytes());
+        b.extend_from_slice(&pk.to_ne_bytes());
+        drop(b);
+        self.condvar.notify_one();
+    }
+}
+
+/// Free an error string delivered via the shared pipe error frame.
+///
+/// # Safety
+/// `ptr` must be a valid pointer returned in a pipe error frame, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn free_pipe_error_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        let _ = unsafe { CString::from_raw(ptr) };
+    }
+}
+
+/// Initialize the process-wide shared pipe for async response delivery.
+/// Spawns a dedicated OS flush thread with adaptive batching.
+///
+/// # Safety
+/// Must be called with a valid writable pipe file descriptor.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn init_shared_pipe(pipe_write_fd: i32) {
+    SHARED_PIPE.get_or_init(|| {
+        let w = SharedPipeWriter {
+            buffer: std::sync::Mutex::new(Vec::with_capacity(FRAME_SIZE * 64)),
+            condvar: Condvar::new(),
+            pipe_fd: pipe_write_fd,
+        };
+        let fd = pipe_write_fd;
+        std::thread::Builder::new()
+            .name("glide-pipe-flush".into())
+            .spawn(move || {
+                while let Some(sw) = SHARED_PIPE.get() {
+                    let data = {
+                        let mut buf = sw.buffer.lock().unwrap();
+                        while buf.is_empty() {
+                            buf = sw.condvar.wait(buf).unwrap();
+                        }
+                        let fc = buf.len() / FRAME_SIZE;
+                        if fc <= 1 {
+                            let mut d = Vec::with_capacity(FRAME_SIZE * 4);
+                            std::mem::swap(&mut *buf, &mut d);
+                            d
+                        } else {
+                            drop(buf);
+                            std::thread::yield_now();
+                            let mut buf = sw.buffer.lock().unwrap();
+                            let mut d = Vec::with_capacity(FRAME_SIZE * 64);
+                            std::mem::swap(&mut *buf, &mut d);
+                            d
+                        }
+                    };
+                    if data.is_empty() {
+                        continue;
+                    }
+                    let mut off = 0;
+                    while off < data.len() {
+                        let w = unsafe {
+                            libc::write(
+                                fd,
+                                data[off..].as_ptr() as *const libc::c_void,
+                                data.len() - off,
+                            )
+                        };
+                        if w <= 0 {
+                            break;
+                        }
+                        off += w as usize;
+                    }
+                }
+            })
+            .expect("flush thread");
+        w
+    });
+}
+
+/// Set the pipe client ID on a client adapter for shared pipe routing.
+///
+/// # Safety
+/// `client_adapter_ptr` must be a valid pointer from `create_client`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn set_pipe_client_id(client_adapter_ptr: *const c_void, client_id: u64) {
+    let ca = unsafe {
+        Arc::increment_strong_count(client_adapter_ptr);
+        Arc::from_raw(client_adapter_ptr as *mut ClientAdapter)
+    };
+    ca.pipe_client_id
+        .store(client_id, std::sync::atomic::Ordering::Release);
+    let _ = Arc::into_raw(ca);
+}
+
 /// A `GlideClient` adapter.
 pub struct ClientAdapter {
     runtime: Runtime,
+    pipe_client_id: std::sync::atomic::AtomicU64,
     /// Background runtime for spawned tasks (connection drivers, reconnection, cluster manager).
     /// Only used by sync clients with current_thread main runtime — tokio::spawn calls during
     /// client creation are directed here via _guard so they run independently of block_on.
@@ -504,7 +627,51 @@ impl ClientAdapter {
                 failure_callback,
                 allow_stack_response,
             } => {
-                // Spawn the request for async client
+                let cid = self
+                    .pipe_client_id
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if cid != 0 && SHARED_PIPE.get().is_some() {
+                    self.runtime.spawn(async move {
+                        match request_future.await {
+                            Ok(value) => {
+                                let buf = response_buf.map(|rb| (rb.0, rb.1));
+                                match valkey_value_to_arena_response(value, buf) {
+                                    Ok((root_ptr, arena_ptr)) => {
+                                        if let Some(w) = SHARED_PIPE.get() {
+                                            w.push_success(
+                                                cid,
+                                                request_id,
+                                                root_ptr as usize,
+                                                arena_ptr as usize,
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        if let Some(w) = SHARED_PIPE.get() {
+                                            w.push_error(
+                                                cid,
+                                                request_id,
+                                                errors::error_type(&err),
+                                                errors::error_message(&err),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                if let Some(w) = SHARED_PIPE.get() {
+                                    w.push_error(
+                                        cid,
+                                        request_id,
+                                        errors::error_type(&err),
+                                        errors::error_message(&err),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                    return std::ptr::null_mut();
+                }
                 self.runtime.spawn(async move {
                     let result = request_future.await;
                     let _ = Self::handle_result(
@@ -889,9 +1056,16 @@ fn create_client_internal(
         ClientType::AsyncClient { .. } => {
             // Async clients need a background worker thread to drive the reactor
             // since the calling thread is owned by the foreign language's event loop.
+            // GLIDE_TOKIO_WORKER_THREADS controls the number of tokio worker threads
+            // (default 1). More workers can help concurrent large-response workloads.
+            let worker_threads = std::env::var("GLIDE_TOKIO_WORKER_THREADS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
             Builder::new_multi_thread()
                 .enable_all()
-                .worker_threads(1)
+                .worker_threads(worker_threads)
                 .thread_name("Valkey-GLIDE thread")
                 .build()
                 .map_err(|err| {
@@ -944,6 +1118,7 @@ fn create_client_internal(
     let pubsub_callback_store = Arc::new(std::sync::RwLock::new(pubsub_callback));
     let client_adapter = Arc::new(ClientAdapter {
         runtime,
+        pipe_client_id: std::sync::atomic::AtomicU64::new(0),
         background_runtime,
         core,
         pubsub_callback: pubsub_callback_store.clone(),
@@ -1947,7 +2122,40 @@ pub struct ResponseArena {
     strings: Vec<Vec<u8>>,
 }
 
+const MAX_ARENA_POOL_SIZE: usize = 16;
+thread_local! { static ARENA_POOL: std::cell::RefCell<Vec<ResponseArena>> = const { std::cell::RefCell::new(Vec::new()) }; }
 impl ResponseArena {
+    fn from_pool(value: &Value) -> Self {
+        let nc = Self::count_nodes(value);
+        ARENA_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if let Some(mut a) = p.pop() {
+                a.nodes.clear();
+                if a.nodes.capacity() < nc {
+                    a.nodes.reserve(nc - a.nodes.capacity());
+                }
+                a.strings.clear();
+                a
+            } else {
+                ResponseArena {
+                    nodes: Vec::with_capacity(nc),
+                    strings: Vec::new(),
+                }
+            }
+        })
+    }
+    fn return_to_pool(self) {
+        ARENA_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < MAX_ARENA_POOL_SIZE {
+                p.push(self);
+            }
+        });
+    }
+}
+
+impl ResponseArena {
+    #[allow(dead_code)]
     fn new(value: &Value) -> Self {
         let node_count = Self::count_nodes(value);
         ResponseArena {
@@ -2209,7 +2417,7 @@ fn valkey_value_to_arena_response(
     value: Value,
     response_buf: Option<(*mut u8, usize)>,
 ) -> RedisResult<(*mut CommandResponse, *mut ResponseArena)> {
-    let mut arena = ResponseArena::new(&value);
+    let mut arena = ResponseArena::from_pool(&value);
     arena.build(value, response_buf)?;
     Ok(arena.finalize())
 }
@@ -2221,7 +2429,8 @@ fn valkey_value_to_arena_response(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_response_arena(arena_ptr: *mut ResponseArena) {
     if !arena_ptr.is_null() {
-        unsafe { drop(Box::from_raw(arena_ptr)) };
+        let arena = unsafe { *Box::from_raw(arena_ptr) };
+        arena.return_to_pool();
     }
 }
 
@@ -2501,38 +2710,15 @@ pub unsafe extern "C-unwind" fn command_with_buffer(
 
     // Check if compression is enabled before converting args
     let compression_manager = client_adapter.core.client.compression_manager();
-    let should_process_compression = compression_manager
-        .as_ref()
-        .map(|cm| cm.is_enabled())
-        .unwrap_or(false);
 
-    if should_process_compression {
-        // Convert arg_vec to owned Vec<Vec<u8>> for compression processing
-        let mut owned_args: Vec<Vec<u8>> = arg_vec.iter().map(|&arg| arg.to_vec()).collect();
-
-        // Apply compression to command arguments
-        if let Err(err) = glide_core::compression::process_command_args_for_compression(
-            &mut owned_args,
-            command_type,
-            compression_manager.as_deref(),
-        ) {
-            let err = RedisError::from((
-                ErrorKind::ClientError,
-                "Compression failed",
-                err.to_string(),
-            ));
-            return unsafe { client_adapter.handle_redis_error(err, request_id) };
-        }
-
-        // Use the compressed arguments
-        for command_arg in &owned_args {
-            cmd.arg(command_arg);
-        }
-    } else {
-        // Use the original arguments
-        for command_arg in &arg_vec {
-            cmd.arg(command_arg);
-        }
+    if let Err(err_msg) = apply_compression_to_cmd(
+        &mut cmd,
+        command_type,
+        &arg_vec,
+        compression_manager.as_ref(),
+    ) {
+        let err = RedisError::from((ErrorKind::ClientError, "Compression failed", err_msg));
+        return unsafe { client_adapter.handle_redis_error(err, request_id) };
     }
 
     if span_ptr != 0 {
@@ -3340,6 +3526,71 @@ pub(crate) unsafe fn create_route(
     }
 }
 
+/// Applies compression to command arguments if compression is enabled.
+///
+/// For `CustomCommand`, resolves the actual request type from the command name (first arg)
+/// to determine compression behavior. Adds arguments to `cmd` either compressed or as-is.
+fn apply_compression_to_cmd(
+    cmd: &mut Cmd,
+    request_type: RequestType,
+    arg_vec: &[&[u8]],
+    compression_manager: Option<&std::sync::Arc<glide_core::compression::CompressionManager>>,
+) -> Result<(), String> {
+    let should_process_compression = compression_manager
+        .as_ref()
+        .map(|cm| cm.is_enabled())
+        .unwrap_or(false);
+
+    if should_process_compression {
+        // For CustomCommand, resolve the actual request type from the command name
+        let (effective_type, arg_offset) =
+            if matches!(request_type, RequestType::CustomCommand) && !arg_vec.is_empty() {
+                let cmd_name = String::from_utf8_lossy(arg_vec[0]).to_uppercase();
+                let resolved = match cmd_name.as_str() {
+                    "SET" => Some(RequestType::Set),
+                    "MSET" => Some(RequestType::MSet),
+                    "MSETNX" => Some(RequestType::MSetNX),
+                    "SETEX" => Some(RequestType::SetEx),
+                    "PSETEX" => Some(RequestType::PSetEx),
+                    "SETNX" => Some(RequestType::SetNX),
+                    _ => None,
+                };
+                match resolved {
+                    Some(rt) => (rt, 1),
+                    None => (request_type, 0),
+                }
+            } else {
+                (request_type, 0)
+            };
+
+        let mut owned_args: Vec<Vec<u8>> = arg_vec[arg_offset..]
+            .iter()
+            .map(|&arg| arg.to_vec())
+            .collect();
+
+        if let Err(err) = glide_core::compression::process_command_args_for_compression(
+            &mut owned_args,
+            effective_type,
+            compression_manager.map(|m| m.as_ref()),
+        ) {
+            return Err(format!("Compression failed: {}", err));
+        }
+
+        if arg_offset > 0 {
+            cmd.arg(arg_vec[0]);
+        }
+        for command_arg in &owned_args {
+            cmd.arg(command_arg);
+        }
+    } else {
+        for command_arg in arg_vec {
+            cmd.arg(command_arg);
+        }
+    }
+
+    Ok(())
+}
+
 /// Convert [`CmdInfo`] to a [`Cmd`].
 ///
 /// # Safety
@@ -3364,35 +3615,7 @@ pub(crate) unsafe fn create_cmd(
         return Err("Couldn't fetch command type".into());
     };
 
-    // Check if compression is enabled before converting args
-    let should_process_compression = compression_manager
-        .as_ref()
-        .map(|cm| cm.is_enabled())
-        .unwrap_or(false);
-
-    if should_process_compression {
-        // Convert arg_vec to owned Vec<Vec<u8>> for compression processing
-        let mut owned_args: Vec<Vec<u8>> = arg_vec.iter().map(|&arg| arg.to_vec()).collect();
-
-        // Apply compression to command arguments
-        if let Err(err) = glide_core::compression::process_command_args_for_compression(
-            &mut owned_args,
-            info.request_type,
-            compression_manager.map(|m| m.as_ref()),
-        ) {
-            return Err(format!("Compression failed: {}", err));
-        }
-
-        // Use the compressed arguments
-        for command_arg in &owned_args {
-            cmd.arg(command_arg);
-        }
-    } else {
-        // Use the original arguments
-        for command_arg in &arg_vec {
-            cmd.arg(command_arg);
-        }
-    }
+    apply_compression_to_cmd(&mut cmd, info.request_type, &arg_vec, compression_manager)?;
 
     Ok(cmd)
 }

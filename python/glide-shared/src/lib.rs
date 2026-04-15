@@ -32,7 +32,7 @@ unsafe fn get_request_error_class() -> *mut ffi::PyObject {
     unsafe {
         if REQUEST_ERROR_CLASS.is_null() {
             let mod_name = ffi::PyUnicode_FromStringAndSize(
-                b"glide_shared.exceptions\0".as_ptr() as *const c_char,
+                c"glide_shared.exceptions".as_ptr(),
                 23,
             );
             if mod_name.is_null() {
@@ -45,10 +45,8 @@ unsafe fn get_request_error_class() -> *mut ffi::PyObject {
                 ffi::PyErr_Clear();
                 return std::ptr::null_mut();
             }
-            let attr = ffi::PyUnicode_FromStringAndSize(
-                b"RequestError\0".as_ptr() as *const c_char,
-                12,
-            );
+            let attr =
+                ffi::PyUnicode_FromStringAndSize(c"RequestError".as_ptr(), 12);
             if attr.is_null() {
                 ffi::Py_DECREF(module);
                 ffi::PyErr_Clear();
@@ -72,24 +70,39 @@ unsafe fn get_request_error_class() -> *mut ffi::PyObject {
 /// and the CFFI declarations in python/glide-shared/glide_shared/_glide_ffi.py.
 unsafe fn convert(resp: *const CommandResponse) -> *mut ffi::PyObject {
     if resp.is_null() {
-        return unsafe { { let n = ffi::Py_None(); ffi::Py_INCREF(n); n } };
+        return unsafe {
+            {
+                let n = ffi::Py_None();
+                ffi::Py_INCREF(n);
+                n
+            }
+        };
     }
     let r = unsafe { &*resp };
     match r.response_type {
-        0 => unsafe { { let n = ffi::Py_None(); ffi::Py_INCREF(n); n } },
+        0 => unsafe {
+            {
+                let n = ffi::Py_None();
+                ffi::Py_INCREF(n);
+                n
+            }
+        },
         1 => unsafe { ffi::PyLong_FromLongLong(r.int_value) },
         2 => unsafe { ffi::PyFloat_FromDouble(r.float_value) },
         3 => unsafe { ffi::PyBool_FromLong(r.bool_value as std::ffi::c_long) },
-        4 => unsafe {
-            ffi::PyBytes_FromStringAndSize(r.string_value, r.string_value_len as isize)
-        },
+        4 => unsafe { ffi::PyBytes_FromStringAndSize(r.string_value, r.string_value_len as isize) },
         5 => unsafe {
             let len = r.array_value_len as isize;
             let list = ffi::PyList_New(len);
-            if list.is_null() { return std::ptr::null_mut(); }
+            if list.is_null() {
+                return std::ptr::null_mut();
+            }
             for i in 0..len {
                 let item = convert(r.array_value.offset(i));
-                if item.is_null() { ffi::Py_DECREF(list); return std::ptr::null_mut(); }
+                if item.is_null() {
+                    ffi::Py_DECREF(list);
+                    return std::ptr::null_mut();
+                }
                 ffi::PyList_SetItem(list, i, item);
             }
             list
@@ -98,13 +111,22 @@ unsafe fn convert(resp: *const CommandResponse) -> *mut ffi::PyObject {
             // Map — wrapper layout: array_value[i].map_key / .map_value
             let n = r.array_value_len as isize;
             let dict = ffi::PyDict_New();
-            if dict.is_null() { return std::ptr::null_mut(); }
+            if dict.is_null() {
+                return std::ptr::null_mut();
+            }
             for i in 0..n {
                 let wrapper = &*r.array_value.offset(i);
                 let key = convert(wrapper.map_key);
-                if key.is_null() { ffi::Py_DECREF(dict); return std::ptr::null_mut(); }
+                if key.is_null() {
+                    ffi::Py_DECREF(dict);
+                    return std::ptr::null_mut();
+                }
                 let val = convert(wrapper.map_value);
-                if val.is_null() { ffi::Py_DECREF(key); ffi::Py_DECREF(dict); return std::ptr::null_mut(); }
+                if val.is_null() {
+                    ffi::Py_DECREF(key);
+                    ffi::Py_DECREF(dict);
+                    return std::ptr::null_mut();
+                }
                 ffi::PyDict_SetItem(dict, key, val);
                 ffi::Py_DECREF(key);
                 ffi::Py_DECREF(val);
@@ -114,17 +136,22 @@ unsafe fn convert(resp: *const CommandResponse) -> *mut ffi::PyObject {
         7 => unsafe {
             let len = r.sets_value_len as isize;
             let set = ffi::PySet_New(std::ptr::null_mut());
-            if set.is_null() { return std::ptr::null_mut(); }
+            if set.is_null() {
+                return std::ptr::null_mut();
+            }
             for i in 0..len {
                 let item = convert(r.sets_value.offset(i));
-                if item.is_null() { ffi::Py_DECREF(set); return std::ptr::null_mut(); }
+                if item.is_null() {
+                    ffi::Py_DECREF(set);
+                    return std::ptr::null_mut();
+                }
                 ffi::PySet_Add(set, item);
                 ffi::Py_DECREF(item);
             }
             set
         },
         8 => unsafe {
-            let s = ffi::PyUnicode_FromStringAndSize(b"OK\0".as_ptr() as *const c_char, 2);
+            let s = ffi::PyUnicode_FromStringAndSize(c"OK".as_ptr(), 2);
             if !s.is_null() {
                 // Intern so that `result is OK` identity checks pass
                 let mut interned = s;
@@ -142,16 +169,32 @@ unsafe fn convert(resp: *const CommandResponse) -> *mut ffi::PyObject {
                 return ffi::PyBytes_FromStringAndSize(r.string_value, r.string_value_len as isize);
             }
             let msg = ffi::PyUnicode_FromStringAndSize(r.string_value, r.string_value_len as isize);
-            if msg.is_null() { ffi::PyErr_Clear(); return ffi::Py_None(); }
+            if msg.is_null() {
+                ffi::PyErr_Clear();
+                return ffi::Py_None();
+            }
             let args = ffi::PyTuple_New(1);
-            if args.is_null() { ffi::Py_DECREF(msg); ffi::PyErr_Clear(); return ffi::Py_None(); }
+            if args.is_null() {
+                ffi::Py_DECREF(msg);
+                ffi::PyErr_Clear();
+                return ffi::Py_None();
+            }
             ffi::PyTuple_SetItem(args, 0, msg); // steals ref to msg
             let obj = ffi::PyObject_CallObject(cls, args);
             ffi::Py_DECREF(args);
-            if obj.is_null() { ffi::PyErr_Clear(); return ffi::Py_None(); }
+            if obj.is_null() {
+                ffi::PyErr_Clear();
+                return ffi::Py_None();
+            }
             obj
         },
-        _ => unsafe { { let n = ffi::Py_None(); ffi::Py_INCREF(n); n } },
+        _ => unsafe {
+            {
+                let n = ffi::Py_None();
+                ffi::Py_INCREF(n);
+                n
+            }
+        },
     }
 }
 
@@ -165,7 +208,11 @@ fn parse_response(py: Python<'_>, ptr: usize) -> (PyObject, usize) {
     let resp = ptr as *const CommandResponse;
     let arena_ptr = unsafe { (*resp).arena_ptr as usize };
     let raw = unsafe { convert(resp) };
-    let obj = if raw.is_null() { py.None() } else { unsafe { PyObject::from_owned_ptr(py, raw) } };
+    let obj = if raw.is_null() {
+        py.None()
+    } else {
+        unsafe { PyObject::from_owned_ptr(py, raw) }
+    };
     (obj, arena_ptr)
 }
 

@@ -1,6 +1,6 @@
 # Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
-from .._glide_ffi import _GlideFFI
+from glide_shared._glide_ffi import _GlideFFI
 
 
 def get_min_compressed_size() -> int:

@@ -18,6 +18,7 @@
 
 #### Fixes
 * CORE: Skip compression/decompression code paths when compression is not configured to eliminate per-command overhead ([#5644](https://github.com/valkey-io/valkey-glide/pull/5644))
+* Python Async: `Logger.logger_level` now returns a `Level` enum instead of an internal PyO3 type, consistent with the sync client ([#5637](https://github.com/valkey-io/valkey-glide/pull/5637))
 
 #### Operational Enhancements
 
@@ -31,6 +32,9 @@
 #### Operational Enhancements
 * Python Sync: Use `current_thread` tokio runtime for sync FFI clients, eliminating cross-thread condvar wake overhead on every command ([#5083](https://github.com/valkey-io/valkey-glide/issues/5083), [#5624](https://github.com/valkey-io/valkey-glide/issues/5624))
 * Python: Add arena-based response allocator and PyO3 fast response parser to eliminate per-node heap allocations and replace CFFI-based recursive Python traversal for large responses ([#5083](https://github.com/valkey-io/valkey-glide/issues/5083), [#5624](https://github.com/valkey-io/valkey-glide/issues/5624))
+* Python Async: Replace protobuf+UDS transport with direct FFI calls and shared buffered pipe for response delivery, eliminating protobuf overhead, UDS socket I/O, and GIL contention ([#5083](https://github.com/valkey-io/valkey-glide/issues/5083), [#5624](https://github.com/valkey-io/valkey-glide/issues/5624))
+* Python: Move shared code (logger, script, cluster_scan_cursor, request_type, ffi_helpers, opentelemetry) to glide-shared, eliminating circular dependencies between glide-async and glide-sync ([#5083](https://github.com/valkey-io/valkey-glide/issues/5083))
+* Python Async: Add `GLIDE_TOKIO_WORKER_THREADS` env var to control tokio worker thread count for the async client runtime (default 1) ([#5083](https://github.com/valkey-io/valkey-glide/issues/5083))
 
 ## 2.3
 

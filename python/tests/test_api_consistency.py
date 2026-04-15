@@ -13,32 +13,8 @@ TESTS_SYNC_DIR = PYTHON_DIR / "tests" / "sync_tests"
 
 
 EXCLUDED_API_FUNCTIONS = {
-    "async_only": [
-        # _CompatFuture
-        "done",
-        "result",
-        "set_exception",
-        "set_result",
-        # opentelemetry
-        "create_otel_span",
-        "drop_otel_span",
-        "get_endpoint",
-        "get_metrics",
-        "get_traces",
-        "init_opentelemetry",
-        "set_traces",
-        # Logger
-        "is_lower",
-        "py_init",
-        "py_log",
-        # others
-        "init_callback",
-        "create_leaked_bytes_vec",
-        "create_leaked_value",
-        "start_socket_listener_external",
-        "value_from_pointer",
-    ],
-    "sync_only": [],
+    "async_only": [],
+    "sync_only": ["get_min_compressed_size"],
 }
 
 EXCLUDED_API_FILENAMES = {
