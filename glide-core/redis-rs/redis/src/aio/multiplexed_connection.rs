@@ -542,24 +542,26 @@ where
                 ))
             })?;
         let send_elapsed = send_start.elapsed();
-        if send_elapsed > std::time::Duration::from_millis(500) {
+        let send_warn_threshold = std::cmp::min(timeout / 4, std::time::Duration::from_millis(500));
+        if send_elapsed > send_warn_threshold {
             logger_core::log_warn(
                 "pipeline",
                 format!(
-                    "pipeline.send() blocked for {:?} (channel capacity=50)",
-                    send_elapsed
+                    "pipeline.send() blocked for {:?} (threshold={:?}, response_timeout={:?}, channel capacity=50)",
+                    send_elapsed, send_warn_threshold, timeout
                 ),
             );
         }
         let recv_start = std::time::Instant::now();
         let recv_result = Runtime::locate().timeout(timeout, receiver).await;
         let recv_elapsed = recv_start.elapsed();
-        if recv_elapsed > std::time::Duration::from_secs(5) {
+        let recv_warn_threshold = std::cmp::min(timeout / 2, std::time::Duration::from_secs(5));
+        if recv_elapsed > recv_warn_threshold {
             logger_core::log_warn(
                 "pipeline",
                 format!(
-                    "Response wait took {:?} (timeout={:?})",
-                    recv_elapsed, timeout
+                    "Response wait took {:?} (threshold={:?}, response_timeout={:?})",
+                    recv_elapsed, recv_warn_threshold, timeout
                 ),
             );
         }
