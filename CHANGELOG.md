@@ -21,6 +21,7 @@
 * Python Async: `Logger.logger_level` now returns a `Level` enum instead of an internal PyO3 type, consistent with the sync client ([#5637](https://github.com/valkey-io/valkey-glide/pull/5637))
 
 #### Operational Enhancements
+* CORE, Java: Add diagnostic logging for failover, topology refresh, and pipeline issues — lazy and rate-limited logging macros in `logger_core`, MOVED error scenario identification, topology refresh throttle/overwrite tracking, pipeline send/response timing, inflight slot exhaustion, recovery state transitions, adaptive health snapshots (5min at DEBUG when healthy, 10s at INFO during recovery), and Java-side timeout elapsed time. Fix Java `Logger` `Supplier` overloads to check level before evaluating. ([#5715](https://github.com/valkey-io/valkey-glide/issues/5715))
 
 
 ## 2.3.1
