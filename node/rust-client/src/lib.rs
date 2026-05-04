@@ -440,6 +440,26 @@ pub fn value_from_split_pointer(
     resp_value_to_js(*value, js_env, string_decoder)
 }
 
+/// Dereference a response pointer passed as a single JS number.
+///
+/// napi-rs marshals `i64` via `napi_get_value_int64`, which preserves all
+/// bits for values within the safe integer range. User-space heap addresses
+/// on current 64-bit platforms (48-bit on arm64 macOS, 47-bit on x86-64
+/// Linux) are well within this range. Using a single integer avoids the
+/// high/low u32 split required by `value_from_split_pointer` and eliminates
+/// the class of bugs where the caller passes the wrong high bits.
+#[napi(
+    ts_return_type = "null | string | Uint8Array | number | {} | Boolean | BigInt | Set<any> | any[] | Buffer"
+)]
+pub fn value_from_pointer(
+    js_env: Env,
+    pointer_number: i64,
+    string_decoder: bool,
+) -> Result<JsUnknown> {
+    let value = unsafe { Box::from_raw(pointer_number as *mut Value) };
+    resp_value_to_js(*value, js_env, string_decoder)
+}
+
 // Pointers are split because JS cannot represent a full usize using its `number` object.
 // The pointer is split into 2 `number`s, and then combined back in `value_from_split_pointer`.
 fn split_pointer<T>(pointer: *mut T) -> [u32; 2] {
