@@ -225,6 +225,7 @@ async fn execute_command_request_and_complete(
     jvm: std::sync::Arc<jni::JavaVM>,
     expect_utf8: bool,
 ) {
+    let request_start = std::time::Instant::now();
     let result: Result<redis::Value, redis::RedisError> = async {
         let mut client = jni_client::ensure_client_for_handle(handle_id)
             .await
@@ -451,6 +452,18 @@ async fn execute_command_request_and_complete(
         }
     }
     .await;
+
+    let request_elapsed = request_start.elapsed();
+    if request_elapsed > std::time::Duration::from_secs(1) {
+        logger_core::log_warn_rate_limited!(
+            "jni_request",
+            5,
+            format!(
+                "request took {:?} for callback_id={}",
+                request_elapsed, callback_id
+            )
+        );
+    }
 
     let binary_mode = !expect_utf8;
     jni_client::complete_callback(jvm, callback_id, result, binary_mode);
