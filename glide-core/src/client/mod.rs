@@ -1048,6 +1048,16 @@ impl Client {
             let self_clone = self.clone();
             let owned_cmd = Arc::new(cmd.clone());
 
+            // Extract command name before moving owned_cmd
+            let cmd_name = owned_cmd
+                .command()
+                .and_then(|c| {
+                    let s = std::str::from_utf8(&c).ok()?.to_uppercase();
+                    crate::request_type::RequestType::from_command_name(&s)
+                })
+                .and_then(|rt| rt.command_name())
+                .unwrap_or("UNKNOWN");
+
             let execute = Self::execute_command_owned(
                 self_clone,
                 owned_cmd,
@@ -1058,26 +1068,47 @@ impl Client {
 
             match request_timeout {
                 Some(duration) => {
-                    let timeout_rx =
-                        crate::timeout_watchdog::TimeoutWatchdog::global().register(duration);
+                    let node: std::sync::Arc<str> = std::sync::Arc::from("pending-routing");
+                    let (timeout_rx, _phase) =
+                        crate::timeout_watchdog::TimeoutWatchdog::global().register(
+                            duration,
+                            cmd_name,
+                            node,
+                            None,
+                        );
                     tokio::pin!(execute);
                     tokio::select! {
                         result = &mut execute => result,
                         recv_result = timeout_rx => {
-                            if recv_result.is_err() {
-                                // Watchdog thread died (sender dropped). Don't spuriously
-                                // timeout — fall through to let the command complete normally
-                                // via Tokio's timer wheel as a fallback.
-                                execute.await
-                            } else {
-                                // Watchdog fired the timeout
-                                if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
-                                    log_error(
-                                        "OpenTelemetry:timeout_error",
-                                        format!("Failed to record timeout error: {e}"),
-                                    );
+                            match recv_result {
+                                Err(_) => {
+                                    // Watchdog thread died (sender dropped). Don't spuriously
+                                    // timeout — fall through to let the command complete normally
+                                    // via Tokio's timer wheel as a fallback.
+                                    execute.await
                                 }
-                                Err(io::Error::from(io::ErrorKind::TimedOut).into())
+                                Ok(event) => {
+                                    // Log structured diagnostic information
+                                    log_warn(
+                                        "timeout_watchdog",
+                                        format!(
+                                            "Timeout: cmd={} node={} cause={:?} phase={:?} \
+                                             pending={} same_node={} elapsed={:?} configured={:?} \
+                                             p99={:?} suggested={:?}",
+                                            event.command, event.node, event.cause, event.phase,
+                                            event.pending_commands, event.same_node_pending,
+                                            event.actual_elapsed, event.configured_timeout,
+                                            event.recent_p99_latency, event.suggested_timeout,
+                                        ),
+                                    );
+                                    if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
+                                        log_error(
+                                            "OpenTelemetry:timeout_error",
+                                            format!("Failed to record timeout error: {e}"),
+                                        );
+                                    }
+                                    Err(io::Error::from(io::ErrorKind::TimedOut).into())
+                                }
                             }
                         }
                     }
