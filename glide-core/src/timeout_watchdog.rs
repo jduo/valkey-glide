@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use dashmap::DashMap;
 use tokio::sync::oneshot;
 
 // ─── Public Types ────────────────────────────────────────────────────────────
@@ -322,28 +321,6 @@ pub struct TimeoutWatchdog {
 /// Global singleton watchdog instance.
 static GLOBAL_WATCHDOG: std::sync::OnceLock<TimeoutWatchdog> = std::sync::OnceLock::new();
 
-/// Global latency tracker shared across all commands.
-static GLOBAL_LATENCY_TRACKER: std::sync::OnceLock<Arc<LatencyTracker>> =
-    std::sync::OnceLock::new();
-
-/// Per-node latency trackers.
-static NODE_LATENCY_TRACKERS: std::sync::OnceLock<Arc<DashMap<Arc<str>, Arc<LatencyTracker>>>> =
-    std::sync::OnceLock::new();
-
-/// Get the global (aggregate) latency tracker.
-pub fn global_latency_tracker() -> &'static Arc<LatencyTracker> {
-    GLOBAL_LATENCY_TRACKER.get_or_init(|| Arc::new(LatencyTracker::new(4096)))
-}
-
-/// Get or create a per-node latency tracker.
-pub fn node_latency_tracker(node: &Arc<str>) -> Arc<LatencyTracker> {
-    let map = NODE_LATENCY_TRACKERS
-        .get_or_init(|| Arc::new(DashMap::new()));
-    map.entry(node.clone())
-        .or_insert_with(|| Arc::new(LatencyTracker::new(1024)))
-        .clone()
-}
-
 /// Atomic phase value constants.
 const PHASE_QUEUED: u8 = 0;
 const PHASE_SENT: u8 = 1;
@@ -481,12 +458,7 @@ impl TimeoutWatchdog {
             }
         }
 
-        let recent_p99 = entry.latency_tracker.as_ref().and_then(|t| t.p99())
-            .or_else(|| {
-                // Fall back to per-node tracker if the global one has no data
-                let trackers = NODE_LATENCY_TRACKERS.get()?;
-                trackers.get(&node)?.p99()
-            });
+        let recent_p99 = entry.latency_tracker.as_ref().and_then(|t| t.p99());
         let rss_bytes = get_rss();
 
         // Classify the cause

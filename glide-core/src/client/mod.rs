@@ -318,6 +318,8 @@ pub struct Client {
     otel_metadata: types::OTelMetadata,
     // Optional client-side cache
     client_side_cache: Option<Arc<dyn GlideCache>>,
+    // Per-client latency tracker for timeout diagnostics
+    latency_tracker: Arc<crate::timeout_watchdog::LatencyTracker>,
 }
 
 async fn run_with_timeout<T>(
@@ -1067,13 +1069,12 @@ impl Client {
                         crate::timeout_watchdog::TimeoutWatchdog::global().register(
                             duration,
                             cmd_name,
-                            Some(crate::timeout_watchdog::global_latency_tracker().clone()),
+                            Some(self.latency_tracker.clone()),
                             inflight,
                         );
 
                     // Attach handle to Cmd so try_cmd_request can call mark_sent
                     // after routing resolves the target node address.
-                    let handle_ref = watchdog_handle.clone();
                     owned_cmd.set_diagnostic_handle(watchdog_handle);
 
                     let owned_cmd = Arc::new(owned_cmd);
@@ -1089,14 +1090,9 @@ impl Client {
                     tokio::pin!(execute);
                     tokio::select! {
                         result = &mut execute => {
-                            // Record latency into global and per-node trackers
+                            // Record latency into per-client tracker
                             let elapsed = cmd_start.elapsed();
-                            crate::timeout_watchdog::global_latency_tracker()
-                                .record(elapsed);
-                            if let Some(node) = handle_ref.node.get() {
-                                crate::timeout_watchdog::node_latency_tracker(node)
-                                    .record(elapsed);
-                            }
+                            self.latency_tracker.record(elapsed);
                             result
                         }
                         recv_result = timeout_rx => {
@@ -2234,6 +2230,7 @@ impl Client {
                 pubsub_synchronizer: pubsub_synchronizer.clone(),
                 otel_metadata,
                 client_side_cache,
+                latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(4096)),
             };
 
             let client_arc = Arc::new(RwLock::new(client));
@@ -2684,6 +2681,7 @@ mod tests {
                 db_namespace: "0".to_string(),
             },
             client_side_cache: None,
+            latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(64)),
         }
     }
 
