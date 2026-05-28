@@ -186,6 +186,36 @@ pub struct TimeoutEvent {
     pub inflight_at_timeout: Option<usize>,
 }
 
+impl std::fmt::Display for TimeoutEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Timeout: cmd={} node={} cause={:?} phase={:?} \
+             elapsed={:?} configured={:?}",
+            self.command, self.node, self.cause, self.phase,
+            self.actual_elapsed, self.configured_timeout,
+        )?;
+        write!(f, " pending={} same_node={}", self.pending_commands, self.same_node_pending)?;
+        if let (Some(at_reg), Some(at_fire)) = (self.inflight_at_register, self.inflight_at_timeout) {
+            let trend = if at_fire > at_reg + 10 {
+                "BUILDING (backpressure increasing during timeout window)"
+            } else if at_reg > at_fire + 10 {
+                "DRAINING (backpressure decreasing, system recovering)"
+            } else {
+                "STABLE (system was already saturated at submission)"
+            };
+            write!(f, " inflight={}→{} {}", at_reg, at_fire, trend)?;
+        }
+        if let Some(p99) = self.recent_p99_latency {
+            write!(f, " p99={:?}", p99)?;
+        }
+        if let Some(suggested) = self.suggested_timeout {
+            write!(f, " suggested_timeout={:?}", suggested)?;
+        }
+        Ok(())
+    }
+}
+
 // ─── Latency Tracker ─────────────────────────────────────────────────────────
 
 /// Per-node latency ring buffer. Lock-free writes via atomic index.

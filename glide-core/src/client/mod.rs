@@ -1107,17 +1107,7 @@ impl Client {
                                 Ok(event) => {
                                     log_warn(
                                         "timeout_watchdog",
-                                        format!(
-                                            "Timeout: cmd={} node={} cause={:?} phase={:?} \
-                                             pending={} same_node={} inflight_at_register={:?} \
-                                             inflight_at_timeout={:?} elapsed={:?} \
-                                             configured={:?} p99={:?} suggested={:?}",
-                                            event.command, event.node, event.cause, event.phase,
-                                            event.pending_commands, event.same_node_pending,
-                                            event.inflight_at_register, event.inflight_at_timeout,
-                                            event.actual_elapsed, event.configured_timeout,
-                                            event.recent_p99_latency, event.suggested_timeout,
-                                        ),
+                                        event.to_string(),
                                     );
                                     if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
                                         log_error(
