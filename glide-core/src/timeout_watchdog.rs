@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use dashmap::DashMap;
 use tokio::sync::oneshot;
 
 // ─── Public Types ────────────────────────────────────────────────────────────
@@ -19,8 +20,8 @@ use tokio::sync::oneshot;
 /// resolution, without any allocation on the hot path.
 #[derive(Debug)]
 pub struct WatchdogHandle {
-    phase: AtomicU8,
-    node: std::sync::OnceLock<Arc<str>>,
+    pub(crate) phase: AtomicU8,
+    pub(crate) node: std::sync::OnceLock<Arc<str>>,
 }
 
 impl WatchdogHandle {
@@ -325,9 +326,22 @@ static GLOBAL_WATCHDOG: std::sync::OnceLock<TimeoutWatchdog> = std::sync::OnceLo
 static GLOBAL_LATENCY_TRACKER: std::sync::OnceLock<Arc<LatencyTracker>> =
     std::sync::OnceLock::new();
 
-/// Get the global latency tracker (lazily initialized).
+/// Per-node latency trackers.
+static NODE_LATENCY_TRACKERS: std::sync::OnceLock<Arc<DashMap<Arc<str>, Arc<LatencyTracker>>>> =
+    std::sync::OnceLock::new();
+
+/// Get the global (aggregate) latency tracker.
 pub fn global_latency_tracker() -> &'static Arc<LatencyTracker> {
     GLOBAL_LATENCY_TRACKER.get_or_init(|| Arc::new(LatencyTracker::new(4096)))
+}
+
+/// Get or create a per-node latency tracker.
+pub fn node_latency_tracker(node: &Arc<str>) -> Arc<LatencyTracker> {
+    let map = NODE_LATENCY_TRACKERS
+        .get_or_init(|| Arc::new(DashMap::new()));
+    map.entry(node.clone())
+        .or_insert_with(|| Arc::new(LatencyTracker::new(1024)))
+        .clone()
 }
 
 /// Atomic phase value constants.
@@ -467,7 +481,12 @@ impl TimeoutWatchdog {
             }
         }
 
-        let recent_p99 = entry.latency_tracker.as_ref().and_then(|t| t.p99());
+        let recent_p99 = entry.latency_tracker.as_ref().and_then(|t| t.p99())
+            .or_else(|| {
+                // Fall back to per-node tracker if the global one has no data
+                let trackers = NODE_LATENCY_TRACKERS.get()?;
+                trackers.get(&node)?.p99()
+            });
         let rss_bytes = get_rss();
 
         // Classify the cause

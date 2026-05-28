@@ -1073,6 +1073,7 @@ impl Client {
 
                     // Attach handle to Cmd so try_cmd_request can call mark_sent
                     // after routing resolves the target node address.
+                    let handle_ref = watchdog_handle.clone();
                     owned_cmd.set_diagnostic_handle(watchdog_handle);
 
                     let owned_cmd = Arc::new(owned_cmd);
@@ -1088,9 +1089,14 @@ impl Client {
                     tokio::pin!(execute);
                     tokio::select! {
                         result = &mut execute => {
-                            // Record successful command latency
+                            // Record latency into global and per-node trackers
+                            let elapsed = cmd_start.elapsed();
                             crate::timeout_watchdog::global_latency_tracker()
-                                .record(cmd_start.elapsed());
+                                .record(elapsed);
+                            if let Some(node) = handle_ref.node.get() {
+                                crate::timeout_watchdog::node_latency_tracker(node)
+                                    .record(elapsed);
+                            }
                             result
                         }
                         recv_result = timeout_rx => {
