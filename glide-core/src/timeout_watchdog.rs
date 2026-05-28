@@ -32,16 +32,10 @@ impl WatchdogHandle {
     }
 
     /// Mark the command as sent and record the resolved node address.
-    /// Called from try_cmd_request after get_connection resolves the route.
+    /// Called from the routing layer after connection resolution.
     #[inline]
     pub fn mark_sent(&self, node_address: &str) {
         let _ = self.node.set(Arc::from(node_address));
-        self.phase.store(PHASE_SENT, Ordering::Release);
-    }
-
-    /// Mark the command as sent without a node address (standalone mode).
-    #[inline]
-    pub fn mark_sent_standalone(&self) {
         self.phase.store(PHASE_SENT, Ordering::Release);
     }
 }
@@ -70,21 +64,20 @@ pub fn cmd_name_from_bytes(bytes: &[u8]) -> &'static str {
             (b"ZREM", "ZREM"), (b"KEYS", "KEYS"), (b"SCAN", "SCAN"), (b"TYPE", "TYPE"),
             (b"INFO", "INFO"), (b"WAIT", "WAIT"), (b"DUMP", "DUMP"), (b"COPY", "COPY"),
             (b"SORT", "SORT"), (b"EVAL", "EVAL"), (b"ECHO", "ECHO"), (b"AUTH", "AUTH"),
-            (b"XADD", "XADD"), (b"XLEN", "XLEN"),
+            (b"XADD", "XADD"), (b"XLEN", "XLEN"), (b"PTTL", "PTTL"),
         ]),
         5 => match_upper(bytes, &[
             (b"LPUSH", "LPUSH"), (b"RPUSH", "RPUSH"), (b"HKEYS", "HKEYS"),
             (b"HVALS", "HVALS"), (b"SCARD", "SCARD"), (b"ZCARD", "ZCARD"),
             (b"WATCH", "WATCH"), (b"MULTI", "MULTI"), (b"XREAD", "XREAD"),
             (b"GETEX", "GETEX"), (b"SETEX", "SETEX"), (b"SETNX", "SETNX"),
-            (b"PTTL", "PTTL"),
+            (b"HMGET", "HMGET"), (b"HMSET", "HMSET"),
         ]),
         6 => match_upper(bytes, &[
             (b"APPEND", "APPEND"), (b"EXISTS", "EXISTS"), (b"EXPIRE", "EXPIRE"),
             (b"INCRBY", "INCRBY"), (b"DECRBY", "DECRBY"), (b"LPUSHX", "LPUSHX"),
             (b"RPUSHX", "RPUSHX"), (b"LRANGE", "LRANGE"), (b"LINDEX", "LINDEX"),
-            (b"HSETNX", "HSETNX"), (b"HMGET", "HMGET"), (b"HMSET", "HMSET"),
-            (b"HGETALL", "HGETALL"), (b"SMOVE", "SMOVE"), (b"SUBSTR", "SUBSTR"),
+            (b"HSETNX", "HSETNX"), (b"SMOVE", "SMOVE"), (b"SUBSTR", "SUBSTR"),
             (b"STRLEN", "STRLEN"), (b"SELECT", "SELECT"), (b"DBSIZE", "DBSIZE"),
             (b"OBJECT", "OBJECT"), (b"CONFIG", "CONFIG"), (b"SCRIPT", "SCRIPT"),
             (b"PUBSUB", "PUBSUB"), (b"XRANGE", "XRANGE"), (b"GETDEL", "GETDEL"),
@@ -93,18 +86,29 @@ pub fn cmd_name_from_bytes(bytes: &[u8]) -> &'static str {
         7 => match_upper(bytes, &[
             (b"HGETALL", "HGETALL"), (b"LINSERT", "LINSERT"), (b"PERSIST", "PERSIST"),
             (b"PUBLISH", "PUBLISH"), (b"CLUSTER", "CLUSTER"), (b"EVALSHA", "EVALSHA"),
-            (b"RESTORE", "RESTORE"), (b"FLUSHDB", "FLUSHDB"),
+            (b"RESTORE", "RESTORE"), (b"FLUSHDB", "FLUSHDB"), (b"PEXPIRE", "PEXPIRE"),
         ]),
-        _ => match_upper(bytes, &[
-            (b"SUBSCRIBE", "SUBSCRIBE"), (b"UNSUBSCRIBE", "UNSUBSCRIBE"),
-            (b"PSUBSCRIBE", "PSUBSCRIBE"), (b"PUNSUBSCRIBE", "PUNSUBSCRIBE"),
-            (b"EXPIREAT", "EXPIREAT"), (b"PEXPIRE", "PEXPIRE"),
-            (b"PEXPIREAT", "PEXPIREAT"), (b"PERSIST", "PERSIST"),
-            (b"FLUSHALL", "FLUSHALL"), (b"RANDOMKEY", "RANDOMKEY"),
-            (b"BITCOUNT", "BITCOUNT"), (b"BITFIELD", "BITFIELD"),
-            (b"SINTERCARD", "SINTERCARD"), (b"ZRANGESTORE", "ZRANGESTORE"),
-            (b"XREADGROUP", "XREADGROUP"), (b"INCRBYFLOAT", "INCRBYFLOAT"),
+        8 => match_upper(bytes, &[
+            (b"EXPIREAT", "EXPIREAT"), (b"BITCOUNT", "BITCOUNT"),
+            (b"BITFIELD", "BITFIELD"), (b"FLUSHALL", "FLUSHALL"),
+            (b"GETRANGE", "GETRANGE"), (b"SETRANGE", "SETRANGE"),
         ]),
+        9 => match_upper(bytes, &[
+            (b"PEXPIREAT", "PEXPIREAT"), (b"SUBSCRIBE", "SUBSCRIBE"),
+            (b"RANDOMKEY", "RANDOMKEY"),
+        ]),
+        10 => match_upper(bytes, &[
+            (b"PSUBSCRIBE", "PSUBSCRIBE"), (b"SINTERCARD", "SINTERCARD"),
+            (b"XREADGROUP", "XREADGROUP"),
+        ]),
+        11 => match_upper(bytes, &[
+            (b"UNSUBSCRIBE", "UNSUBSCRIBE"), (b"INCRBYFLOAT", "INCRBYFLOAT"),
+            (b"ZRANGESTORE", "ZRANGESTORE"),
+        ]),
+        12 => match_upper(bytes, &[
+            (b"PUNSUBSCRIBE", "PUNSUBSCRIBE"),
+        ]),
+        _ => None,
     }
     .unwrap_or("UNKNOWN")
 }
@@ -316,6 +320,15 @@ pub struct TimeoutWatchdog {
 
 /// Global singleton watchdog instance.
 static GLOBAL_WATCHDOG: std::sync::OnceLock<TimeoutWatchdog> = std::sync::OnceLock::new();
+
+/// Global latency tracker shared across all commands.
+static GLOBAL_LATENCY_TRACKER: std::sync::OnceLock<Arc<LatencyTracker>> =
+    std::sync::OnceLock::new();
+
+/// Get the global latency tracker (lazily initialized).
+pub fn global_latency_tracker() -> &'static Arc<LatencyTracker> {
+    GLOBAL_LATENCY_TRACKER.get_or_init(|| Arc::new(LatencyTracker::new(4096)))
+}
 
 /// Atomic phase value constants.
 const PHASE_QUEUED: u8 = 0;
@@ -999,6 +1012,14 @@ mod tests {
         assert_eq!(cmd_name_from_bytes(b"EXPIRE"), "EXPIRE");
         assert_eq!(cmd_name_from_bytes(b"CLUSTER"), "CLUSTER");
         assert_eq!(cmd_name_from_bytes(b"SUBSCRIBE"), "SUBSCRIBE");
+        // Previously broken: wrong length arms
+        assert_eq!(cmd_name_from_bytes(b"PTTL"), "PTTL");
+        assert_eq!(cmd_name_from_bytes(b"HMGET"), "HMGET");
+        assert_eq!(cmd_name_from_bytes(b"HMSET"), "HMSET");
+        assert_eq!(cmd_name_from_bytes(b"BITCOUNT"), "BITCOUNT");
+        assert_eq!(cmd_name_from_bytes(b"EXPIREAT"), "EXPIREAT");
+        assert_eq!(cmd_name_from_bytes(b"PEXPIREAT"), "PEXPIREAT");
+        assert_eq!(cmd_name_from_bytes(b"INCRBYFLOAT"), "INCRBYFLOAT");
         assert_eq!(cmd_name_from_bytes(b"unknowncmd"), "UNKNOWN");
     }
 

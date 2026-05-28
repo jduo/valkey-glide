@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Handle};
 pub use types::*;
 
@@ -1067,7 +1067,7 @@ impl Client {
                         crate::timeout_watchdog::TimeoutWatchdog::global().register(
                             duration,
                             cmd_name,
-                            None,
+                            Some(crate::timeout_watchdog::global_latency_tracker().clone()),
                             inflight,
                         );
 
@@ -1084,9 +1084,15 @@ impl Client {
                         compression_manager,
                     );
 
+                    let cmd_start = Instant::now();
                     tokio::pin!(execute);
                     tokio::select! {
-                        result = &mut execute => result,
+                        result = &mut execute => {
+                            // Record successful command latency
+                            crate::timeout_watchdog::global_latency_tracker()
+                                .record(cmd_start.elapsed());
+                            result
+                        }
                         recv_result = timeout_rx => {
                             match recv_result {
                                 Err(_) => {
