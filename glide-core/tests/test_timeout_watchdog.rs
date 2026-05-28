@@ -25,7 +25,7 @@ async fn global_watchdog_is_singleton() {
 #[tokio::test]
 async fn global_watchdog_fires_timeout() {
     let watchdog = TimeoutWatchdog::global();
-    let (rx, handle) = watchdog.register(Duration::from_millis(40), "PING", None, None);
+    let (rx, handle) = watchdog.register(Duration::from_millis(40), "PING", None, None, None, 0);
     handle.mark_sent("127.0.0.1:6379");
 
     let event = rx.await.unwrap();
@@ -42,7 +42,7 @@ async fn command_completes_before_timeout() {
     let watchdog = TimeoutWatchdog::start();
     let tracker = Arc::new(LatencyTracker::new(100));
 
-    let (rx, handle) = watchdog.register(Duration::from_millis(200), "GET", Some(tracker.clone()), None);
+    let (rx, handle) = watchdog.register(Duration::from_millis(200), "GET", Some(tracker.clone()), None, None, 0);
     handle.mark_sent("127.0.0.1:6379");
 
     // Simulate command completing after 50ms
@@ -68,7 +68,7 @@ async fn mixed_completion_and_timeout() {
     // Register 5 commands: first 3 will "complete", last 2 will timeout
     let mut timeout_receivers = Vec::new();
     for i in 0..5 {
-        let (rx, handle) = watchdog.register(Duration::from_millis(100), "GET", Some(tracker.clone()), None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(100), "GET", Some(tracker.clone()), None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
         if i < 3 {
             // Simulate completion
@@ -100,12 +100,12 @@ async fn multi_node_timeout_classification() {
 
     let mut receivers = Vec::new();
     for _ in 0..3 {
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
         handle.mark_sent("10.0.0.1:6379");
         receivers.push(rx);
     }
     for _ in 0..3 {
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "SET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "SET", None, None, None, 0);
         handle.mark_sent("10.0.0.2:6379");
         receivers.push(rx);
     }
@@ -124,12 +124,12 @@ async fn single_node_dominates_pending() {
     // 8 commands to bad_node, 2 to good_node
     let mut receivers = Vec::new();
     for _ in 0..8 {
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
         handle.mark_sent("10.0.0.99:6379");
         receivers.push(rx);
     }
     for _ in 0..2 {
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
         handle.mark_sent("10.0.0.1:6379");
         receivers.push(rx);
     }
@@ -155,7 +155,7 @@ async fn shared_tracker_across_commands() {
     }
 
     // Now a command times out — should see the accumulated p99
-    let (rx, handle) = watchdog.register(Duration::from_millis(30), "HGETALL", Some(tracker.clone()), None);
+    let (rx, handle) = watchdog.register(Duration::from_millis(30), "HGETALL", Some(tracker.clone()), None, None, 0);
     handle.mark_sent("127.0.0.1:6379");
 
     let event = rx.await.unwrap();
@@ -198,7 +198,7 @@ async fn concurrent_latency_recording() {
 async fn actual_elapsed_accuracy() {
     let watchdog = TimeoutWatchdog::start();
     let start = Instant::now();
-    let (rx, handle) = watchdog.register(Duration::from_millis(75), "GET", None, None);
+    let (rx, handle) = watchdog.register(Duration::from_millis(75), "GET", None, None, None, 0);
     handle.mark_sent("127.0.0.1:6379");
 
     let event = rx.await.unwrap();
@@ -218,7 +218,7 @@ async fn actual_elapsed_accuracy() {
 async fn configured_timeout_matches_registration() {
     let watchdog = TimeoutWatchdog::start();
     let timeout = Duration::from_millis(42);
-    let (rx, handle) = watchdog.register(timeout, "SET", None, None);
+    let (rx, handle) = watchdog.register(timeout, "SET", None, None, None, 0);
     handle.mark_sent("127.0.0.1:6379");
 
     let event = rx.await.unwrap();
@@ -234,12 +234,12 @@ async fn watchdog_survives_rapid_register_cancel_cycles() {
 
     // Rapid register + cancel (simulates fast commands)
     for _ in 0..5000 {
-        let (rx, _) = watchdog.register(Duration::from_secs(10), "GET", None, None);
+        let (rx, _) = watchdog.register(Duration::from_secs(10), "GET", None, None, None, 0);
         drop(rx);
     }
 
     // Now register one that should actually fire
-    let (rx, handle) = watchdog.register(Duration::from_millis(30), "PING", None, None);
+    let (rx, handle) = watchdog.register(Duration::from_millis(30), "PING", None, None, None, 0);
     handle.mark_sent("127.0.0.1:6379");
 
     let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
@@ -252,7 +252,7 @@ async fn watchdog_survives_rapid_register_cancel_cycles() {
 #[tokio::test]
 async fn zero_duration_timeout_fires_immediately() {
     let watchdog = TimeoutWatchdog::start();
-    let (rx, handle) = watchdog.register(Duration::from_millis(0), "GET", None, None);
+    let (rx, handle) = watchdog.register(Duration::from_millis(0), "GET", None, None, None, 0);
     handle.mark_sent("127.0.0.1:6379");
 
     let result = tokio::time::timeout(Duration::from_millis(100), rx).await;
@@ -265,11 +265,11 @@ async fn long_timeout_doesnt_block_short() {
     let watchdog = TimeoutWatchdog::start();
 
     // Register a 10-second timeout first
-    let (_long_rx, _) = watchdog.register(Duration::from_secs(10), "SLOWLOG", None, None);
+    let (_long_rx, _) = watchdog.register(Duration::from_secs(10), "SLOWLOG", None, None, None, 0);
 
     // Then a 50ms timeout — should fire on time
     let start = Instant::now();
-    let (short_rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+    let (short_rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
     handle.mark_sent("127.0.0.1:6379");
 
     let event = short_rx.await.unwrap();

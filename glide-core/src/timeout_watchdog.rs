@@ -6,7 +6,7 @@
 //! Mutex on the command path.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -180,8 +180,10 @@ pub struct TimeoutEvent {
     pub rss_bytes: Option<u64>,
     /// Suggested timeout based on recent latency observations.
     pub suggested_timeout: Option<Duration>,
-    /// Number of inflight requests at the time of timeout.
-    pub inflight_count: Option<usize>,
+    /// Number of inflight requests when the command was submitted.
+    pub inflight_at_register: Option<usize>,
+    /// Number of inflight requests when the timeout fired.
+    pub inflight_at_timeout: Option<usize>,
 }
 
 // ─── Latency Tracker ─────────────────────────────────────────────────────────
@@ -306,7 +308,9 @@ struct DeadlineEntry {
     handle: Arc<WatchdogHandle>,
     submitted_at: Instant,
     latency_tracker: Option<Arc<LatencyTracker>>,
-    inflight_count: Option<usize>,
+    inflight_at_register: Option<usize>,
+    inflight_counter: Option<Arc<AtomicIsize>>,
+    inflight_limit: isize,
 }
 
 // ─── Timeout Watchdog ────────────────────────────────────────────────────────
@@ -353,6 +357,8 @@ impl TimeoutWatchdog {
         command: &'static str,
         latency_tracker: Option<Arc<LatencyTracker>>,
         inflight_count: Option<usize>,
+        inflight_counter: Option<Arc<AtomicIsize>>,
+        inflight_limit: isize,
     ) -> (oneshot::Receiver<TimeoutEvent>, Arc<WatchdogHandle>) {
         let (sender, rx) = oneshot::channel();
         let submitted_at = Instant::now();
@@ -367,7 +373,9 @@ impl TimeoutWatchdog {
             handle,
             submitted_at,
             latency_tracker,
-            inflight_count,
+            inflight_at_register: inflight_count,
+            inflight_counter,
+            inflight_limit,
         });
 
         (rx, handle_clone)
@@ -487,7 +495,10 @@ impl TimeoutWatchdog {
             recent_p99_latency: recent_p99,
             rss_bytes,
             suggested_timeout,
-            inflight_count: entry.inflight_count,
+            inflight_at_register: entry.inflight_at_register,
+            inflight_at_timeout: entry.inflight_counter.as_ref().map(|counter| {
+                (entry.inflight_limit - counter.load(Ordering::Relaxed)) as usize
+            }),
         }
     }
 
@@ -540,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn fires_with_diagnostic_event() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -555,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn does_not_fire_before_deadline() {
         let watchdog = TimeoutWatchdog::start();
-        let (mut rx, _handle) = watchdog.register(Duration::from_millis(200), "GET", None, None);
+        let (mut rx, _handle) = watchdog.register(Duration::from_millis(200), "GET", None, None, None, 0);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
     }
@@ -563,8 +574,8 @@ mod tests {
     #[tokio::test]
     async fn multiple_deadlines_fire_in_order() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx1, handle1) = watchdog.register(Duration::from_millis(30), "GET", None, None);
-        let (rx2, handle2) = watchdog.register(Duration::from_millis(60), "SET", None, None);
+        let (rx1, handle1) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
+        let (rx2, handle2) = watchdog.register(Duration::from_millis(60), "SET", None, None, None, 0);
         handle1.mark_sent("127.0.0.1:6379");
         handle2.mark_sent("127.0.0.1:6379");
 
@@ -581,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_before_deadline_does_not_fire() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(200), "GET", None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(200), "GET", None, None, None, 0);
         // Drop the receiver — simulates command completing before timeout
         drop(rx);
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -593,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn phase_defaults_to_queued() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "SET", None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "SET", None, None, None, 0);
         // Don't call mark_sent
 
         let event = rx.await.unwrap();
@@ -603,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn phase_transitions_to_sent() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "SET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "SET", None, None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -614,7 +625,7 @@ mod tests {
     async fn late_phase_transition_captured() {
         // Phase transitions after registration but before fire should be captured
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(80), "SET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(80), "SET", None, None, None, 0);
 
         // Transition after 30ms (before the 80ms deadline)
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -629,7 +640,7 @@ mod tests {
     #[tokio::test]
     async fn classifies_client_backpressure_when_queued() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "SET", None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "SET", None, None, None, 0);
 
         let event = rx.await.unwrap();
         assert!(matches!(event.cause, TimeoutCause::ClientBackpressure { .. }));
@@ -638,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn classifies_server_unresponsive_single_command() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -651,7 +662,7 @@ mod tests {
 
         let mut receivers = Vec::new();
         for _ in 0..10 {
-            let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+            let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
             handle.mark_sent("10.0.0.1:6379");
             receivers.push(rx);
         }
@@ -670,7 +681,7 @@ mod tests {
         // Register >100 commands across different nodes
         let mut receivers = Vec::new();
         for i in 0..110 {
-            let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+            let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
             handle.mark_sent(&format!("10.0.0.{}:6379", i % 50));
             receivers.push(rx);
         }
@@ -686,16 +697,16 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
 
         // 3 commands to node_a, 2 to node_b, all with same deadline
-        let (rx_target, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+        let (rx_target, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
         handle.mark_sent("10.0.0.1:6379");
         let mut _holders = Vec::new();
         for _ in 0..2 {
-            let (rx, h) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+            let (rx, h) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
             h.mark_sent("10.0.0.1:6379");
             _holders.push(rx);
         }
         for _ in 0..2 {
-            let (rx, h) = watchdog.register(Duration::from_millis(50), "SET", None, None);
+            let (rx, h) = watchdog.register(Duration::from_millis(50), "SET", None, None, None, 0);
             h.mark_sent("10.0.0.2:6379");
             _holders.push(rx);
         }
@@ -751,7 +762,7 @@ mod tests {
             tracker.record(Duration::from_millis(i));
         }
 
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", Some(tracker), None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", Some(tracker), None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -772,7 +783,7 @@ mod tests {
             tracker.record(Duration::from_millis(10));
         }
 
-        let (rx, handle) = watchdog.register(Duration::from_millis(20), "GET", Some(tracker), None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(20), "GET", Some(tracker), None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -792,7 +803,7 @@ mod tests {
             tracker.record(Duration::from_millis(1));
         }
 
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", Some(tracker), None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", Some(tracker), None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -804,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn no_suggested_timeout_without_tracker() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -816,7 +827,7 @@ mod tests {
     #[tokio::test]
     async fn rss_is_populated_on_supported_platforms() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -836,7 +847,7 @@ mod tests {
         let start = Instant::now();
         let mut receivers = Vec::with_capacity(10_000);
         for _ in 0..10_000 {
-            let (rx, _) = watchdog.register(Duration::from_secs(60), "GET", None, None);
+            let (rx, _) = watchdog.register(Duration::from_secs(60), "GET", None, None, None, 0);
             receivers.push(rx);
         }
         let elapsed = start.elapsed();
@@ -854,13 +865,13 @@ mod tests {
 
         // Register 1000 timeouts and immediately drop receivers
         for _ in 0..1000 {
-            let (_rx, _) = watchdog.register(Duration::from_secs(1), "GET", None, None);
+            let (_rx, _) = watchdog.register(Duration::from_secs(1), "GET", None, None, None, 0);
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Watchdog should still function after cleanup
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "PING", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "PING", None, None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
         let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
         assert!(result.is_ok(), "Watchdog should still function after cleanup");
@@ -881,6 +892,8 @@ mod tests {
                         "GET",
                         None,
                         None,
+                        None,
+                        0,
                     );
                     handle.mark_sent("127.0.0.1:6379");
                     rxs.push(rx);
@@ -901,7 +914,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn watchdog_fires_under_tokio_starvation() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(100), "PING", None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(100), "PING", None, None, None, 0);
 
         let blocker = tokio::spawn(async {
             let start = Instant::now();
@@ -919,7 +932,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn starvation_produces_diagnostic_event() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(80), "CLUSTER SLOTS", None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(80), "CLUSTER SLOTS", None, None, None, 0);
 
         let blocker = tokio::spawn(async {
             let start = Instant::now();
@@ -944,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_event_is_debug_printable() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -960,7 +973,7 @@ mod tests {
     async fn diagnostic_handle_on_cmd_sets_node_and_phase() {
         // Simulates the full flow: register → attach to Cmd → on_sent → fire
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "SET", None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "SET", None, None, None, 0);
 
         // Simulate what try_cmd_request does: call on_sent via DiagnosticHandle trait
         use redis::DiagnosticHandle;
@@ -976,7 +989,7 @@ mod tests {
     async fn diagnostic_handle_attaches_to_cmd() {
         // Verify the handle can be stored on and retrieved from a Cmd
         let watchdog = TimeoutWatchdog::start();
-        let (_rx, handle) = watchdog.register(Duration::from_secs(60), "GET", None, None);
+        let (_rx, handle) = watchdog.register(Duration::from_secs(60), "GET", None, None, None, 0);
 
         let mut cmd = redis::cmd("GET");
         cmd.arg("mykey");
@@ -1019,7 +1032,7 @@ mod tests {
         // If routing never completes (e.g., connection failure), phase stays Queued
         // and node is "unknown"
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
         // Don't call mark_sent — simulates routing failure
 
         let event = rx.await.unwrap();
@@ -1031,10 +1044,16 @@ mod tests {
     #[tokio::test]
     async fn inflight_count_propagated_to_event() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, Some(42));
+        let inflight_allowed = Arc::new(AtomicIsize::new(958)); // 1000 - 42 = 958 remaining
+        let (rx, handle) = watchdog.register(
+            Duration::from_millis(30), "GET", None, Some(42),
+            Some(inflight_allowed.clone()), 1000,
+        );
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
-        assert_eq!(event.inflight_count, Some(42));
+        assert_eq!(event.inflight_at_register, Some(42));
+        // At fire time: 1000 - 958 = 42 (unchanged)
+        assert_eq!(event.inflight_at_timeout, Some(42));
     }
 }
