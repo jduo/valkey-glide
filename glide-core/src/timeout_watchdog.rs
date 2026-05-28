@@ -6,13 +6,117 @@
 //! Mutex on the command path.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 // ─── Public Types ────────────────────────────────────────────────────────────
+
+/// Handle shared between the caller and the watchdog. Allows the routing layer
+/// to update the node address and mark the command as sent after connection
+/// resolution, without any allocation on the hot path.
+#[derive(Debug)]
+pub struct WatchdogHandle {
+    phase: AtomicU8,
+    node: std::sync::OnceLock<Arc<str>>,
+}
+
+impl WatchdogHandle {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(PHASE_QUEUED),
+            node: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Mark the command as sent and record the resolved node address.
+    /// Called from try_cmd_request after get_connection resolves the route.
+    #[inline]
+    pub fn mark_sent(&self, node_address: &str) {
+        let _ = self.node.set(Arc::from(node_address));
+        self.phase.store(PHASE_SENT, Ordering::Release);
+    }
+
+    /// Mark the command as sent without a node address (standalone mode).
+    #[inline]
+    pub fn mark_sent_standalone(&self) {
+        self.phase.store(PHASE_SENT, Ordering::Release);
+    }
+}
+
+impl redis::DiagnosticHandle for WatchdogHandle {
+    fn on_sent(&self, node_address: &str) {
+        self.mark_sent(node_address);
+    }
+}
+
+/// Resolve a command name from raw bytes to a &'static str without allocation.
+/// Falls back to "UNKNOWN" for unrecognized commands.
+pub fn cmd_name_from_bytes(bytes: &[u8]) -> &'static str {
+    // Compare case-insensitively against common commands
+    match bytes.len() {
+        2 => match_upper(bytes, &[(b"EX", "EX")]),
+        3 => match_upper(bytes, &[
+            (b"GET", "GET"), (b"SET", "SET"), (b"DEL", "DEL"), (b"TTL", "TTL"),
+            (b"ACL", "ACL"),
+        ]),
+        4 => match_upper(bytes, &[
+            (b"PING", "PING"), (b"MGET", "MGET"), (b"MSET", "MSET"), (b"INCR", "INCR"),
+            (b"DECR", "DECR"), (b"HGET", "HGET"), (b"HSET", "HSET"), (b"HDEL", "HDEL"),
+            (b"HLEN", "HLEN"), (b"LLEN", "LLEN"), (b"LPOS", "LPOS"), (b"LPOP", "LPOP"),
+            (b"RPOP", "RPOP"), (b"SADD", "SADD"), (b"SREM", "SREM"), (b"ZADD", "ZADD"),
+            (b"ZREM", "ZREM"), (b"KEYS", "KEYS"), (b"SCAN", "SCAN"), (b"TYPE", "TYPE"),
+            (b"INFO", "INFO"), (b"WAIT", "WAIT"), (b"DUMP", "DUMP"), (b"COPY", "COPY"),
+            (b"SORT", "SORT"), (b"EVAL", "EVAL"), (b"ECHO", "ECHO"), (b"AUTH", "AUTH"),
+            (b"XADD", "XADD"), (b"XLEN", "XLEN"),
+        ]),
+        5 => match_upper(bytes, &[
+            (b"LPUSH", "LPUSH"), (b"RPUSH", "RPUSH"), (b"HKEYS", "HKEYS"),
+            (b"HVALS", "HVALS"), (b"SCARD", "SCARD"), (b"ZCARD", "ZCARD"),
+            (b"WATCH", "WATCH"), (b"MULTI", "MULTI"), (b"XREAD", "XREAD"),
+            (b"GETEX", "GETEX"), (b"SETEX", "SETEX"), (b"SETNX", "SETNX"),
+            (b"PTTL", "PTTL"),
+        ]),
+        6 => match_upper(bytes, &[
+            (b"APPEND", "APPEND"), (b"EXISTS", "EXISTS"), (b"EXPIRE", "EXPIRE"),
+            (b"INCRBY", "INCRBY"), (b"DECRBY", "DECRBY"), (b"LPUSHX", "LPUSHX"),
+            (b"RPUSHX", "RPUSHX"), (b"LRANGE", "LRANGE"), (b"LINDEX", "LINDEX"),
+            (b"HSETNX", "HSETNX"), (b"HMGET", "HMGET"), (b"HMSET", "HMSET"),
+            (b"HGETALL", "HGETALL"), (b"SMOVE", "SMOVE"), (b"SUBSTR", "SUBSTR"),
+            (b"STRLEN", "STRLEN"), (b"SELECT", "SELECT"), (b"DBSIZE", "DBSIZE"),
+            (b"OBJECT", "OBJECT"), (b"CONFIG", "CONFIG"), (b"SCRIPT", "SCRIPT"),
+            (b"PUBSUB", "PUBSUB"), (b"XRANGE", "XRANGE"), (b"GETDEL", "GETDEL"),
+            (b"GETSET", "GETSET"), (b"RENAME", "RENAME"), (b"UNLINK", "UNLINK"),
+        ]),
+        7 => match_upper(bytes, &[
+            (b"HGETALL", "HGETALL"), (b"LINSERT", "LINSERT"), (b"PERSIST", "PERSIST"),
+            (b"PUBLISH", "PUBLISH"), (b"CLUSTER", "CLUSTER"), (b"EVALSHA", "EVALSHA"),
+            (b"RESTORE", "RESTORE"), (b"FLUSHDB", "FLUSHDB"),
+        ]),
+        _ => match_upper(bytes, &[
+            (b"SUBSCRIBE", "SUBSCRIBE"), (b"UNSUBSCRIBE", "UNSUBSCRIBE"),
+            (b"PSUBSCRIBE", "PSUBSCRIBE"), (b"PUNSUBSCRIBE", "PUNSUBSCRIBE"),
+            (b"EXPIREAT", "EXPIREAT"), (b"PEXPIRE", "PEXPIRE"),
+            (b"PEXPIREAT", "PEXPIREAT"), (b"PERSIST", "PERSIST"),
+            (b"FLUSHALL", "FLUSHALL"), (b"RANDOMKEY", "RANDOMKEY"),
+            (b"BITCOUNT", "BITCOUNT"), (b"BITFIELD", "BITFIELD"),
+            (b"SINTERCARD", "SINTERCARD"), (b"ZRANGESTORE", "ZRANGESTORE"),
+            (b"XREADGROUP", "XREADGROUP"), (b"INCRBYFLOAT", "INCRBYFLOAT"),
+        ]),
+    }
+    .unwrap_or("UNKNOWN")
+}
+
+fn match_upper(input: &[u8], table: &[(&[u8], &'static str)]) -> Option<&'static str> {
+    for &(pattern, name) in table {
+        if input.eq_ignore_ascii_case(pattern) {
+            return Some(name);
+        }
+    }
+    None
+}
 
 /// The phase a command was in when the timeout fired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,9 +299,8 @@ struct DeadlineEntry {
     sender: oneshot::Sender<TimeoutEvent>,
     // Diagnostic metadata (cheap to attach at register time):
     command: &'static str,
-    node: Arc<str>,
+    handle: Arc<WatchdogHandle>,
     submitted_at: Instant,
-    phase: Arc<std::sync::atomic::AtomicU8>,
     latency_tracker: Option<Arc<LatencyTracker>>,
     inflight_count: Option<usize>,
 }
@@ -236,7 +339,7 @@ impl TimeoutWatchdog {
 
     /// Register a timeout with diagnostic context. Returns:
     /// - A `oneshot::Receiver<TimeoutEvent>` that resolves with diagnostics if the deadline fires
-    /// - A phase handle that the caller updates when the command transitions from Queued to Sent
+    /// - A `WatchdogHandle` that the routing layer uses to mark the command as sent and record the node
     ///
     /// This is the hot path — only cheap copies here.
     #[inline]
@@ -244,34 +347,26 @@ impl TimeoutWatchdog {
         &self,
         timeout: Duration,
         command: &'static str,
-        node: Arc<str>,
         latency_tracker: Option<Arc<LatencyTracker>>,
         inflight_count: Option<usize>,
-    ) -> (oneshot::Receiver<TimeoutEvent>, Arc<std::sync::atomic::AtomicU8>) {
+    ) -> (oneshot::Receiver<TimeoutEvent>, Arc<WatchdogHandle>) {
         let (sender, rx) = oneshot::channel();
         let submitted_at = Instant::now();
-        let phase = Arc::new(std::sync::atomic::AtomicU8::new(PHASE_QUEUED));
-        let phase_clone = phase.clone();
+        let handle = Arc::new(WatchdogHandle::new());
+        let handle_clone = handle.clone();
         let deadline = submitted_at + timeout;
 
         let _ = self.tx.send(DeadlineEntry {
             deadline,
             sender,
             command,
-            node,
+            handle,
             submitted_at,
-            phase,
             latency_tracker,
             inflight_count,
         });
 
-        (rx, phase_clone)
-    }
-
-    /// Mark a command as sent. Call this when the command leaves the client.
-    #[inline]
-    pub fn mark_sent(phase: &std::sync::atomic::AtomicU8) {
-        phase.store(PHASE_SENT, Ordering::Release);
+        (rx, handle_clone)
     }
 
     /// Watchdog thread main loop.
@@ -332,12 +427,17 @@ impl TimeoutWatchdog {
         let actual_elapsed = now.duration_since(entry.submitted_at);
         let configured_timeout = entry.deadline.duration_since(entry.submitted_at);
 
-        let phase_val = entry.phase.load(Ordering::Acquire);
+        let phase_val = entry.handle.phase.load(Ordering::Acquire);
         let phase = if phase_val == PHASE_SENT {
             CommandPhase::Sent
         } else {
             CommandPhase::Queued
         };
+
+        // Resolve node: use the address set by try_cmd_request, or "unknown"
+        static UNKNOWN_NODE: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+        let unknown = UNKNOWN_NODE.get_or_init(|| Arc::from("unknown"));
+        let node = entry.handle.node.get().unwrap_or(unknown).clone();
 
         // Count pending commands (total and same-node)
         let mut pending_total = 0usize;
@@ -346,7 +446,8 @@ impl TimeoutWatchdog {
             for e in entries {
                 if !e.sender.is_closed() {
                     pending_total += 1;
-                    if e.node == entry.node {
+                    let e_node = e.handle.node.get().unwrap_or(unknown);
+                    if *e_node == node {
                         same_node_pending += 1;
                     }
                 }
@@ -359,7 +460,7 @@ impl TimeoutWatchdog {
         // Classify the cause
         let cause = Self::classify(
             phase,
-            &entry.node,
+            &node,
             actual_elapsed,
             configured_timeout,
             same_node_pending,
@@ -373,7 +474,7 @@ impl TimeoutWatchdog {
         TimeoutEvent {
             cause,
             command: entry.command,
-            node: entry.node.clone(),
+            node,
             phase,
             configured_timeout,
             actual_elapsed,
@@ -435,9 +536,8 @@ mod tests {
     #[tokio::test]
     async fn fires_with_diagnostic_event() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         assert_eq!(event.command, "GET");
@@ -451,8 +551,7 @@ mod tests {
     #[tokio::test]
     async fn does_not_fire_before_deadline() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (mut rx, _phase) = watchdog.register(Duration::from_millis(200), "GET", node.clone(), None, None);
+        let (mut rx, _handle) = watchdog.register(Duration::from_millis(200), "GET", None, None);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
     }
@@ -460,11 +559,10 @@ mod tests {
     #[tokio::test]
     async fn multiple_deadlines_fire_in_order() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx1, phase1) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None, None);
-        let (rx2, phase2) = watchdog.register(Duration::from_millis(60), "SET", node.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase1);
-        TimeoutWatchdog::mark_sent(&phase2);
+        let (rx1, handle1) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        let (rx2, handle2) = watchdog.register(Duration::from_millis(60), "SET", None, None);
+        handle1.mark_sent("127.0.0.1:6379");
+        handle2.mark_sent("127.0.0.1:6379");
 
         let event1 = rx1.await.unwrap();
         let mid = Instant::now();
@@ -479,8 +577,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_before_deadline_does_not_fire() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, _phase) = watchdog.register(Duration::from_millis(200), "GET", node.clone(), None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(200), "GET", None, None);
         // Drop the receiver — simulates command completing before timeout
         drop(rx);
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -492,8 +589,7 @@ mod tests {
     #[tokio::test]
     async fn phase_defaults_to_queued() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, _phase) = watchdog.register(Duration::from_millis(30), "SET", node.clone(), None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "SET", None, None);
         // Don't call mark_sent
 
         let event = rx.await.unwrap();
@@ -503,9 +599,8 @@ mod tests {
     #[tokio::test]
     async fn phase_transitions_to_sent() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "SET", node.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "SET", None, None);
+        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         assert_eq!(event.phase, CommandPhase::Sent);
@@ -515,12 +610,11 @@ mod tests {
     async fn late_phase_transition_captured() {
         // Phase transitions after registration but before fire should be captured
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(80), "SET", node.clone(), None, None);
+        let (rx, handle) = watchdog.register(Duration::from_millis(80), "SET", None, None);
 
         // Transition after 30ms (before the 80ms deadline)
         tokio::time::sleep(Duration::from_millis(30)).await;
-        TimeoutWatchdog::mark_sent(&phase);
+        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         assert_eq!(event.phase, CommandPhase::Sent);
@@ -531,8 +625,7 @@ mod tests {
     #[tokio::test]
     async fn classifies_client_backpressure_when_queued() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, _phase) = watchdog.register(Duration::from_millis(30), "SET", node.clone(), None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "SET", None, None);
 
         let event = rx.await.unwrap();
         assert!(matches!(event.cause, TimeoutCause::ClientBackpressure { .. }));
@@ -541,9 +634,8 @@ mod tests {
     #[tokio::test]
     async fn classifies_server_unresponsive_single_command() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("10.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         assert!(matches!(event.cause, TimeoutCause::ServerUnresponsive { .. }));
@@ -552,12 +644,11 @@ mod tests {
     #[tokio::test]
     async fn classifies_node_degraded_many_same_node() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("10.0.0.1:6379");
 
         let mut receivers = Vec::new();
         for _ in 0..10 {
-            let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node.clone(), None, None);
-            TimeoutWatchdog::mark_sent(&phase);
+            let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+            handle.mark_sent("10.0.0.1:6379");
             receivers.push(rx);
         }
 
@@ -575,9 +666,8 @@ mod tests {
         // Register >100 commands across different nodes
         let mut receivers = Vec::new();
         for i in 0..110 {
-            let node: Arc<str> = Arc::from(format!("10.0.0.{}:6379", i % 50));
-            let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node, None, None);
-            TimeoutWatchdog::mark_sent(&phase);
+            let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+            handle.mark_sent(&format!("10.0.0.{}:6379", i % 50));
             receivers.push(rx);
         }
 
@@ -590,21 +680,19 @@ mod tests {
     #[tokio::test]
     async fn reports_pending_command_counts() {
         let watchdog = TimeoutWatchdog::start();
-        let node_a: Arc<str> = Arc::from("10.0.0.1:6379");
-        let node_b: Arc<str> = Arc::from("10.0.0.2:6379");
 
         // 3 commands to node_a, 2 to node_b, all with same deadline
-        let (rx_target, phase) = watchdog.register(Duration::from_millis(50), "GET", node_a.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx_target, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+        handle.mark_sent("10.0.0.1:6379");
         let mut _holders = Vec::new();
         for _ in 0..2 {
-            let (rx, p) = watchdog.register(Duration::from_millis(50), "GET", node_a.clone(), None, None);
-            TimeoutWatchdog::mark_sent(&p);
+            let (rx, h) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+            h.mark_sent("10.0.0.1:6379");
             _holders.push(rx);
         }
         for _ in 0..2 {
-            let (rx, p) = watchdog.register(Duration::from_millis(50), "SET", node_b.clone(), None, None);
-            TimeoutWatchdog::mark_sent(&p);
+            let (rx, h) = watchdog.register(Duration::from_millis(50), "SET", None, None);
+            h.mark_sent("10.0.0.2:6379");
             _holders.push(rx);
         }
 
@@ -652,7 +740,6 @@ mod tests {
     #[tokio::test]
     async fn timeout_event_includes_p99_from_tracker() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
         let tracker = Arc::new(LatencyTracker::new(100));
 
         // Populate tracker with latency data
@@ -660,8 +747,8 @@ mod tests {
             tracker.record(Duration::from_millis(i));
         }
 
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), Some(tracker), None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", Some(tracker), None);
+        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         assert!(event.recent_p99_latency.is_some());
@@ -674,7 +761,6 @@ mod tests {
     #[tokio::test]
     async fn suggested_timeout_is_3x_p99() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
         let tracker = Arc::new(LatencyTracker::new(100));
 
         // All latencies are 10ms → p99 ≈ 10ms → suggested ≈ 30ms
@@ -682,8 +768,8 @@ mod tests {
             tracker.record(Duration::from_millis(10));
         }
 
-        let (rx, phase) = watchdog.register(Duration::from_millis(20), "GET", node.clone(), Some(tracker), None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(20), "GET", Some(tracker), None);
+        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         let suggested = event.suggested_timeout.unwrap();
@@ -695,7 +781,6 @@ mod tests {
     #[tokio::test]
     async fn suggested_timeout_at_least_configured() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
         let tracker = Arc::new(LatencyTracker::new(100));
 
         // All latencies are 1ms → p99 ≈ 1ms → 3x = 3ms, but configured is 30ms
@@ -703,8 +788,8 @@ mod tests {
             tracker.record(Duration::from_millis(1));
         }
 
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), Some(tracker), None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", Some(tracker), None);
+        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         let suggested = event.suggested_timeout.unwrap();
@@ -715,9 +800,8 @@ mod tests {
     #[tokio::test]
     async fn no_suggested_timeout_without_tracker() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         assert!(event.suggested_timeout.is_none());
@@ -728,9 +812,8 @@ mod tests {
     #[tokio::test]
     async fn rss_is_populated_on_supported_platforms() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         if cfg!(any(target_os = "linux", target_os = "macos")) {
@@ -746,11 +829,10 @@ mod tests {
     #[tokio::test]
     async fn high_throughput_register() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
         let start = Instant::now();
         let mut receivers = Vec::with_capacity(10_000);
         for _ in 0..10_000 {
-            let (rx, _) = watchdog.register(Duration::from_secs(60), "GET", node.clone(), None, None);
+            let (rx, _) = watchdog.register(Duration::from_secs(60), "GET", None, None);
             receivers.push(rx);
         }
         let elapsed = start.elapsed();
@@ -765,18 +847,17 @@ mod tests {
     #[tokio::test]
     async fn completed_commands_dont_accumulate() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
 
         // Register 1000 timeouts and immediately drop receivers
         for _ in 0..1000 {
-            let (_rx, _) = watchdog.register(Duration::from_secs(1), "GET", node.clone(), None, None);
+            let (_rx, _) = watchdog.register(Duration::from_secs(1), "GET", None, None);
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Watchdog should still function after cleanup
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "PING", node.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "PING", None, None);
+        handle.mark_sent("127.0.0.1:6379");
         let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
         assert!(result.is_ok(), "Watchdog should still function after cleanup");
     }
@@ -784,23 +865,20 @@ mod tests {
     #[tokio::test]
     async fn concurrent_register_from_multiple_tasks() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
 
         let mut handles = Vec::new();
         for _ in 0..10 {
             let w = watchdog.clone();
-            let n = node.clone();
             handles.push(tokio::spawn(async move {
                 let mut rxs = Vec::new();
                 for _ in 0..100 {
-                    let (rx, phase) = w.register(
+                    let (rx, handle) = w.register(
                         Duration::from_millis(50),
                         "GET",
-                        n.clone(),
                         None,
                         None,
                     );
-                    TimeoutWatchdog::mark_sent(&phase);
+                    handle.mark_sent("127.0.0.1:6379");
                     rxs.push(rx);
                 }
                 // All should fire
@@ -819,8 +897,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn watchdog_fires_under_tokio_starvation() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, _phase) = watchdog.register(Duration::from_millis(100), "PING", node.clone(), None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(100), "PING", None, None);
 
         let blocker = tokio::spawn(async {
             let start = Instant::now();
@@ -838,8 +915,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn starvation_produces_diagnostic_event() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, _phase) = watchdog.register(Duration::from_millis(80), "CLUSTER SLOTS", node.clone(), None, None);
+        let (rx, _handle) = watchdog.register(Duration::from_millis(80), "CLUSTER SLOTS", None, None);
 
         let blocker = tokio::spawn(async {
             let start = Instant::now();
@@ -864,9 +940,8 @@ mod tests {
     #[tokio::test]
     async fn timeout_event_is_debug_printable() {
         let watchdog = TimeoutWatchdog::start();
-        let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         let debug_str = format!("{:?}", event);

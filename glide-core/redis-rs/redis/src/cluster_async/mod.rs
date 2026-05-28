@@ -3050,6 +3050,11 @@ where
             set_routed_node_on_span(&span, &address);
         }
 
+        // Mark command as sent for watchdog diagnostics
+        if let Some(handle) = cmd.diagnostic_handle() {
+            handle.on_sent(&address);
+        }
+
         conn.req_packed_command(&cmd)
             .await
             .map(Response::Single)

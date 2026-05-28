@@ -1046,18 +1046,16 @@ impl Client {
                 None
             };
             let self_clone = self.clone();
-            let owned_cmd = Arc::new(cmd.clone());
-
-            let execute = Self::execute_command_owned(
-                self_clone,
-                owned_cmd,
-                routing,
-                client,
-                compression_manager,
-            );
+            let mut owned_cmd = cmd.clone();
 
             match request_timeout {
                 Some(duration) => {
+                    // Resolve command name from raw bytes (zero allocation)
+                    let cmd_name = owned_cmd
+                        .arg_idx(0)
+                        .map(crate::timeout_watchdog::cmd_name_from_bytes)
+                        .unwrap_or("UNKNOWN");
+
                     // Compute inflight count (cheap atomic load)
                     let inflight = Some(
                         (self.inflight_requests_limit
@@ -1065,37 +1063,38 @@ impl Client {
                             as usize,
                     );
 
-                    // TODO: Move diagnostic registration to try_cmd_request (redis-rs layer)
-                    // where the actual node address is known after routing. For now, register
-                    // with minimal metadata to avoid hot-path allocations. The watchdog still
-                    // provides value: timeout delivery independent of Tokio.
-                    static PENDING_NODE: std::sync::OnceLock<Arc<str>> =
-                        std::sync::OnceLock::new();
-                    let node = PENDING_NODE
-                        .get_or_init(|| Arc::from("pending-routing"))
-                        .clone();
-
-                    let (timeout_rx, _phase) =
+                    let (timeout_rx, watchdog_handle) =
                         crate::timeout_watchdog::TimeoutWatchdog::global().register(
                             duration,
-                            "UNKNOWN", // TODO: resolve in try_cmd_request
-                            node,
+                            cmd_name,
                             None,
                             inflight,
                         );
+
+                    // Attach handle to Cmd so try_cmd_request can call mark_sent
+                    // after routing resolves the target node address.
+                    owned_cmd.set_diagnostic_handle(watchdog_handle);
+
+                    let owned_cmd = Arc::new(owned_cmd);
+                    let execute = Self::execute_command_owned(
+                        self_clone,
+                        owned_cmd,
+                        routing,
+                        client,
+                        compression_manager,
+                    );
+
                     tokio::pin!(execute);
                     tokio::select! {
                         result = &mut execute => result,
                         recv_result = timeout_rx => {
                             match recv_result {
                                 Err(_) => {
-                                    // Watchdog thread died (sender dropped). Don't spuriously
-                                    // timeout — fall through to let the command complete normally
-                                    // via Tokio's timer wheel as a fallback.
+                                    // Watchdog thread died — fall through to let the
+                                    // command complete via Tokio's timer as fallback.
                                     execute.await
                                 }
                                 Ok(event) => {
-                                    // Log structured diagnostic information
                                     log_warn(
                                         "timeout_watchdog",
                                         format!(
@@ -1121,7 +1120,17 @@ impl Client {
                         }
                     }
                 }
-                None => execute.await,
+                None => {
+                    let owned_cmd = Arc::new(owned_cmd);
+                    let execute = Self::execute_command_owned(
+                        self_clone,
+                        owned_cmd,
+                        routing,
+                        client,
+                        compression_manager,
+                    );
+                    execute.await
+                }
             }
         })
     }

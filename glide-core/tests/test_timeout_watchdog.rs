@@ -25,9 +25,8 @@ async fn global_watchdog_is_singleton() {
 #[tokio::test]
 async fn global_watchdog_fires_timeout() {
     let watchdog = TimeoutWatchdog::global();
-    let node: Arc<str> = Arc::from("127.0.0.1:6379");
-    let (rx, phase) = watchdog.register(Duration::from_millis(40), "PING", node.clone(), None, None);
-    TimeoutWatchdog::mark_sent(&phase);
+    let (rx, handle) = watchdog.register(Duration::from_millis(40), "PING", None, None);
+    handle.mark_sent("127.0.0.1:6379");
 
     let event = rx.await.unwrap();
     assert_eq!(event.command, "PING");
@@ -41,11 +40,10 @@ async fn global_watchdog_fires_timeout() {
 #[tokio::test]
 async fn command_completes_before_timeout() {
     let watchdog = TimeoutWatchdog::start();
-    let node: Arc<str> = Arc::from("10.0.0.1:6379");
     let tracker = Arc::new(LatencyTracker::new(100));
 
-    let (rx, phase) = watchdog.register(Duration::from_millis(200), "GET", node.clone(), Some(tracker.clone()), None);
-    TimeoutWatchdog::mark_sent(&phase);
+    let (rx, handle) = watchdog.register(Duration::from_millis(200), "GET", Some(tracker.clone()), None);
+    handle.mark_sent("127.0.0.1:6379");
 
     // Simulate command completing after 50ms
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -60,7 +58,6 @@ async fn command_completes_before_timeout() {
 #[tokio::test]
 async fn mixed_completion_and_timeout() {
     let watchdog = TimeoutWatchdog::start();
-    let node: Arc<str> = Arc::from("10.0.0.1:6379");
     let tracker = Arc::new(LatencyTracker::new(100));
 
     // Pre-populate tracker with normal latencies
@@ -71,8 +68,8 @@ async fn mixed_completion_and_timeout() {
     // Register 5 commands: first 3 will "complete", last 2 will timeout
     let mut timeout_receivers = Vec::new();
     for i in 0..5 {
-        let (rx, phase) = watchdog.register(Duration::from_millis(100), "GET", node.clone(), Some(tracker.clone()), None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(100), "GET", Some(tracker.clone()), None);
+        handle.mark_sent("127.0.0.1:6379");
         if i < 3 {
             // Simulate completion
             tracker.record(Duration::from_millis(10));
@@ -100,18 +97,16 @@ async fn multi_node_timeout_classification() {
     let watchdog = TimeoutWatchdog::start();
 
     // 3 commands to node A, 3 to node B — evenly distributed
-    let node_a: Arc<str> = Arc::from("10.0.0.1:6379");
-    let node_b: Arc<str> = Arc::from("10.0.0.2:6379");
 
     let mut receivers = Vec::new();
     for _ in 0..3 {
-        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node_a.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+        handle.mark_sent("10.0.0.1:6379");
         receivers.push(rx);
     }
     for _ in 0..3 {
-        let (rx, phase) = watchdog.register(Duration::from_millis(50), "SET", node_b.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "SET", None, None);
+        handle.mark_sent("10.0.0.2:6379");
         receivers.push(rx);
     }
 
@@ -125,19 +120,17 @@ async fn multi_node_timeout_classification() {
 #[tokio::test]
 async fn single_node_dominates_pending() {
     let watchdog = TimeoutWatchdog::start();
-    let bad_node: Arc<str> = Arc::from("10.0.0.99:6379");
-    let good_node: Arc<str> = Arc::from("10.0.0.1:6379");
 
     // 8 commands to bad_node, 2 to good_node
     let mut receivers = Vec::new();
     for _ in 0..8 {
-        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", bad_node.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+        handle.mark_sent("10.0.0.99:6379");
         receivers.push(rx);
     }
     for _ in 0..2 {
-        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", good_node.clone(), None, None);
-        TimeoutWatchdog::mark_sent(&phase);
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+        handle.mark_sent("10.0.0.1:6379");
         receivers.push(rx);
     }
 
@@ -153,7 +146,6 @@ async fn single_node_dominates_pending() {
 #[tokio::test]
 async fn shared_tracker_across_commands() {
     let watchdog = TimeoutWatchdog::start();
-    let node: Arc<str> = Arc::from("10.0.0.1:6379");
     let tracker = Arc::new(LatencyTracker::new(1024));
 
     // Simulate 200 successful commands with varying latency
@@ -163,8 +155,8 @@ async fn shared_tracker_across_commands() {
     }
 
     // Now a command times out — should see the accumulated p99
-    let (rx, phase) = watchdog.register(Duration::from_millis(30), "HGETALL", node.clone(), Some(tracker.clone()), None);
-    TimeoutWatchdog::mark_sent(&phase);
+    let (rx, handle) = watchdog.register(Duration::from_millis(30), "HGETALL", Some(tracker.clone()), None);
+    handle.mark_sent("127.0.0.1:6379");
 
     let event = rx.await.unwrap();
     let p99 = event.recent_p99_latency.unwrap();
@@ -205,10 +197,9 @@ async fn concurrent_latency_recording() {
 #[tokio::test]
 async fn actual_elapsed_accuracy() {
     let watchdog = TimeoutWatchdog::start();
-    let node: Arc<str> = Arc::from("127.0.0.1:6379");
     let start = Instant::now();
-    let (rx, phase) = watchdog.register(Duration::from_millis(75), "GET", node.clone(), None, None);
-    TimeoutWatchdog::mark_sent(&phase);
+    let (rx, handle) = watchdog.register(Duration::from_millis(75), "GET", None, None);
+    handle.mark_sent("127.0.0.1:6379");
 
     let event = rx.await.unwrap();
     let wall_elapsed = start.elapsed();
@@ -226,10 +217,9 @@ async fn actual_elapsed_accuracy() {
 #[tokio::test]
 async fn configured_timeout_matches_registration() {
     let watchdog = TimeoutWatchdog::start();
-    let node: Arc<str> = Arc::from("127.0.0.1:6379");
     let timeout = Duration::from_millis(42);
-    let (rx, phase) = watchdog.register(timeout, "SET", node.clone(), None, None);
-    TimeoutWatchdog::mark_sent(&phase);
+    let (rx, handle) = watchdog.register(timeout, "SET", None, None);
+    handle.mark_sent("127.0.0.1:6379");
 
     let event = rx.await.unwrap();
     assert_eq!(event.configured_timeout, timeout);
@@ -241,17 +231,16 @@ async fn configured_timeout_matches_registration() {
 #[tokio::test]
 async fn watchdog_survives_rapid_register_cancel_cycles() {
     let watchdog = TimeoutWatchdog::start();
-    let node: Arc<str> = Arc::from("127.0.0.1:6379");
 
     // Rapid register + cancel (simulates fast commands)
     for _ in 0..5000 {
-        let (rx, _) = watchdog.register(Duration::from_secs(10), "GET", node.clone(), None, None);
+        let (rx, _) = watchdog.register(Duration::from_secs(10), "GET", None, None);
         drop(rx);
     }
 
     // Now register one that should actually fire
-    let (rx, phase) = watchdog.register(Duration::from_millis(30), "PING", node.clone(), None, None);
-    TimeoutWatchdog::mark_sent(&phase);
+    let (rx, handle) = watchdog.register(Duration::from_millis(30), "PING", None, None);
+    handle.mark_sent("127.0.0.1:6379");
 
     let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
     assert!(result.is_ok());
@@ -263,9 +252,8 @@ async fn watchdog_survives_rapid_register_cancel_cycles() {
 #[tokio::test]
 async fn zero_duration_timeout_fires_immediately() {
     let watchdog = TimeoutWatchdog::start();
-    let node: Arc<str> = Arc::from("127.0.0.1:6379");
-    let (rx, phase) = watchdog.register(Duration::from_millis(0), "GET", node.clone(), None, None);
-    TimeoutWatchdog::mark_sent(&phase);
+    let (rx, handle) = watchdog.register(Duration::from_millis(0), "GET", None, None);
+    handle.mark_sent("127.0.0.1:6379");
 
     let result = tokio::time::timeout(Duration::from_millis(100), rx).await;
     assert!(result.is_ok(), "Zero-duration timeout should fire immediately");
@@ -275,15 +263,14 @@ async fn zero_duration_timeout_fires_immediately() {
 #[tokio::test]
 async fn long_timeout_doesnt_block_short() {
     let watchdog = TimeoutWatchdog::start();
-    let node: Arc<str> = Arc::from("127.0.0.1:6379");
 
     // Register a 10-second timeout first
-    let (_long_rx, _) = watchdog.register(Duration::from_secs(10), "SLOWLOG", node.clone(), None, None);
+    let (_long_rx, _) = watchdog.register(Duration::from_secs(10), "SLOWLOG", None, None);
 
     // Then a 50ms timeout — should fire on time
     let start = Instant::now();
-    let (short_rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node.clone(), None, None);
-    TimeoutWatchdog::mark_sent(&phase);
+    let (short_rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None);
+    handle.mark_sent("127.0.0.1:6379");
 
     let event = short_rx.await.unwrap();
     let elapsed = start.elapsed();

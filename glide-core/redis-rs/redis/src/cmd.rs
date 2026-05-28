@@ -44,6 +44,16 @@ pub struct Cmd {
     /// timeout from internal pipeline cleanup.
     #[cfg(feature = "cluster-async")]
     inflight_tracker: Option<crate::cluster_async::InflightRequestTracker>,
+    /// Opaque diagnostic handle for timeout watchdog. The routing layer calls
+    /// into this after resolving the target node address.
+    diagnostic_handle: Option<std::sync::Arc<dyn DiagnosticHandle>>,
+}
+
+/// Trait for diagnostic handles that receive routing information.
+/// Implemented by the timeout watchdog to track command phase transitions.
+pub trait DiagnosticHandle: Send + Sync {
+    /// Called when the command has been routed and sent to a specific node.
+    fn on_sent(&self, node_address: &str);
 }
 
 /// The PING command used to fence other commands for ordering guarantees
@@ -367,6 +377,7 @@ impl Cmd {
             response_timeout: None,
             #[cfg(feature = "cluster-async")]
             inflight_tracker: None,
+            diagnostic_handle: None,
         }
     }
 
@@ -382,6 +393,7 @@ impl Cmd {
             response_timeout: None,
             #[cfg(feature = "cluster-async")]
             inflight_tracker: None,
+            diagnostic_handle: None,
         }
     }
 
@@ -693,6 +705,21 @@ impl Cmd {
     #[inline]
     pub fn set_inflight_tracker(&mut self, tracker: crate::cluster_async::InflightRequestTracker) {
         self.inflight_tracker = Some(tracker);
+    }
+
+    /// Attach a diagnostic handle for timeout watchdog.
+    #[inline]
+    pub fn set_diagnostic_handle(
+        &mut self,
+        handle: std::sync::Arc<dyn DiagnosticHandle>,
+    ) {
+        self.diagnostic_handle = Some(handle);
+    }
+
+    /// Get the diagnostic handle.
+    #[inline]
+    pub fn diagnostic_handle(&self) -> Option<&std::sync::Arc<dyn DiagnosticHandle>> {
+        self.diagnostic_handle.as_ref()
     }
 }
 
