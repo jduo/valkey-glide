@@ -949,4 +949,80 @@ mod tests {
         assert!(debug_str.contains("127.0.0.1:6379"));
         assert!(debug_str.contains("ServerUnresponsive"));
     }
+
+    // ── Wiring Verification ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn diagnostic_handle_on_cmd_sets_node_and_phase() {
+        // Simulates the full flow: register → attach to Cmd → on_sent → fire
+        let watchdog = TimeoutWatchdog::start();
+        let (rx, handle) = watchdog.register(Duration::from_millis(50), "SET", None, None);
+
+        // Simulate what try_cmd_request does: call on_sent via DiagnosticHandle trait
+        use redis::DiagnosticHandle;
+        handle.on_sent("10.0.0.5:6379");
+
+        let event = rx.await.unwrap();
+        assert_eq!(event.command, "SET");
+        assert_eq!(event.node.as_ref(), "10.0.0.5:6379");
+        assert_eq!(event.phase, CommandPhase::Sent);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_handle_attaches_to_cmd() {
+        // Verify the handle can be stored on and retrieved from a Cmd
+        let watchdog = TimeoutWatchdog::start();
+        let (_rx, handle) = watchdog.register(Duration::from_secs(60), "GET", None, None);
+
+        let mut cmd = redis::cmd("GET");
+        cmd.arg("mykey");
+        cmd.set_diagnostic_handle(handle.clone());
+
+        // Retrieve and call on_sent (simulates try_cmd_request)
+        let retrieved = cmd.diagnostic_handle().unwrap();
+        retrieved.on_sent("192.168.1.1:6379");
+
+        // Verify the original handle was updated
+        assert_eq!(handle.node.get().unwrap().as_ref(), "192.168.1.1:6379");
+        assert_eq!(handle.phase.load(Ordering::Acquire), PHASE_SENT);
+    }
+
+    #[tokio::test]
+    async fn cmd_name_from_bytes_resolves_common_commands() {
+        assert_eq!(cmd_name_from_bytes(b"GET"), "GET");
+        assert_eq!(cmd_name_from_bytes(b"get"), "GET");
+        assert_eq!(cmd_name_from_bytes(b"Set"), "SET");
+        assert_eq!(cmd_name_from_bytes(b"HGETALL"), "HGETALL");
+        assert_eq!(cmd_name_from_bytes(b"ping"), "PING");
+        assert_eq!(cmd_name_from_bytes(b"ZADD"), "ZADD");
+        assert_eq!(cmd_name_from_bytes(b"LPUSH"), "LPUSH");
+        assert_eq!(cmd_name_from_bytes(b"EXPIRE"), "EXPIRE");
+        assert_eq!(cmd_name_from_bytes(b"CLUSTER"), "CLUSTER");
+        assert_eq!(cmd_name_from_bytes(b"SUBSCRIBE"), "SUBSCRIBE");
+        assert_eq!(cmd_name_from_bytes(b"unknowncmd"), "UNKNOWN");
+    }
+
+    #[tokio::test]
+    async fn timeout_without_mark_sent_reports_queued_and_unknown_node() {
+        // If routing never completes (e.g., connection failure), phase stays Queued
+        // and node is "unknown"
+        let watchdog = TimeoutWatchdog::start();
+        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "GET", None, None);
+        // Don't call mark_sent — simulates routing failure
+
+        let event = rx.await.unwrap();
+        assert_eq!(event.phase, CommandPhase::Queued);
+        assert_eq!(event.node.as_ref(), "unknown");
+        assert!(matches!(event.cause, TimeoutCause::ClientBackpressure { .. }));
+    }
+
+    #[tokio::test]
+    async fn inflight_count_propagated_to_event() {
+        let watchdog = TimeoutWatchdog::start();
+        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, Some(42));
+        handle.mark_sent("127.0.0.1:6379");
+
+        let event = rx.await.unwrap();
+        assert_eq!(event.inflight_count, Some(42));
+    }
 }
