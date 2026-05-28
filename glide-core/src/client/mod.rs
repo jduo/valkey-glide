@@ -1048,16 +1048,6 @@ impl Client {
             let self_clone = self.clone();
             let owned_cmd = Arc::new(cmd.clone());
 
-            // Extract command name before moving owned_cmd
-            let cmd_name = owned_cmd
-                .command()
-                .and_then(|c| {
-                    let s = std::str::from_utf8(&c).ok()?.to_uppercase();
-                    crate::request_type::RequestType::from_command_name(&s)
-                })
-                .and_then(|rt| rt.command_name())
-                .unwrap_or("UNKNOWN");
-
             let execute = Self::execute_command_owned(
                 self_clone,
                 owned_cmd,
@@ -1068,13 +1058,30 @@ impl Client {
 
             match request_timeout {
                 Some(duration) => {
-                    let node: std::sync::Arc<str> = std::sync::Arc::from("pending-routing");
+                    // Compute inflight count (cheap atomic load)
+                    let inflight = Some(
+                        (self.inflight_requests_limit
+                            - self.inflight_requests_allowed.load(Ordering::Relaxed))
+                            as usize,
+                    );
+
+                    // TODO: Move diagnostic registration to try_cmd_request (redis-rs layer)
+                    // where the actual node address is known after routing. For now, register
+                    // with minimal metadata to avoid hot-path allocations. The watchdog still
+                    // provides value: timeout delivery independent of Tokio.
+                    static PENDING_NODE: std::sync::OnceLock<Arc<str>> =
+                        std::sync::OnceLock::new();
+                    let node = PENDING_NODE
+                        .get_or_init(|| Arc::from("pending-routing"))
+                        .clone();
+
                     let (timeout_rx, _phase) =
                         crate::timeout_watchdog::TimeoutWatchdog::global().register(
                             duration,
-                            cmd_name,
+                            "UNKNOWN", // TODO: resolve in try_cmd_request
                             node,
                             None,
+                            inflight,
                         );
                     tokio::pin!(execute);
                     tokio::select! {
@@ -1093,10 +1100,11 @@ impl Client {
                                         "timeout_watchdog",
                                         format!(
                                             "Timeout: cmd={} node={} cause={:?} phase={:?} \
-                                             pending={} same_node={} elapsed={:?} configured={:?} \
-                                             p99={:?} suggested={:?}",
+                                             pending={} same_node={} inflight={:?} elapsed={:?} \
+                                             configured={:?} p99={:?} suggested={:?}",
                                             event.command, event.node, event.cause, event.phase,
                                             event.pending_commands, event.same_node_pending,
+                                            event.inflight_count,
                                             event.actual_elapsed, event.configured_timeout,
                                             event.recent_p99_latency, event.suggested_timeout,
                                         ),

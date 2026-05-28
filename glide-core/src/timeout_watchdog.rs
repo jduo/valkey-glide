@@ -72,6 +72,8 @@ pub struct TimeoutEvent {
     pub rss_bytes: Option<u64>,
     /// Suggested timeout based on recent latency observations.
     pub suggested_timeout: Option<Duration>,
+    /// Number of inflight requests at the time of timeout.
+    pub inflight_count: Option<usize>,
 }
 
 // ─── Latency Tracker ─────────────────────────────────────────────────────────
@@ -89,9 +91,14 @@ pub struct LatencyTracker {
     capacity: usize,
 }
 
+/// Sentinel value indicating an unwritten slot.
+const LATENCY_UNWRITTEN: u64 = u64::MAX;
+
 impl LatencyTracker {
     pub fn new(capacity: usize) -> Self {
-        let samples: Vec<AtomicU64> = (0..capacity).map(|_| AtomicU64::new(0)).collect();
+        let samples: Vec<AtomicU64> = (0..capacity)
+            .map(|_| AtomicU64::new(LATENCY_UNWRITTEN))
+            .collect();
         Self {
             samples: samples.into_boxed_slice(),
             write_idx: AtomicUsize::new(0),
@@ -104,24 +111,28 @@ impl LatencyTracker {
     pub fn record(&self, latency: Duration) {
         let micros = latency.as_micros() as u64;
         let idx = self.write_idx.fetch_add(1, Ordering::Relaxed) % self.capacity;
-        self.samples[idx].store(micros, Ordering::Relaxed);
-        let _ = self.count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+        self.samples[idx].store(micros, Ordering::Release);
+        let _ = self.count.fetch_update(Ordering::Release, Ordering::Relaxed, |c| {
             if c < self.capacity { Some(c + 1) } else { None }
         });
     }
 
     /// Compute p99 from the ring buffer. Called only at fire time (rare).
     pub fn p99(&self) -> Option<Duration> {
-        let n = self.count.load(Ordering::Relaxed).min(self.capacity);
+        let n = self.count.load(Ordering::Acquire).min(self.capacity);
         if n < 10 {
             return None; // Not enough data
         }
         let mut buf: Vec<u64> = (0..n)
-            .map(|i| self.samples[i].load(Ordering::Relaxed))
+            .map(|i| self.samples[i].load(Ordering::Acquire))
+            .filter(|&v| v != LATENCY_UNWRITTEN)
             .collect();
+        if buf.len() < 10 {
+            return None;
+        }
         buf.sort_unstable();
-        let idx = (n as f64 * 0.99) as usize;
-        Some(Duration::from_micros(buf[idx.min(n - 1)]))
+        let idx = (buf.len() as f64 * 0.99) as usize;
+        Some(Duration::from_micros(buf[idx.min(buf.len() - 1)]))
     }
 }
 
@@ -145,8 +156,19 @@ fn get_rss() -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        // Use sysctl-style approach via process_info command to avoid libc dependency.
-        // Falls back to None if unavailable — diagnostics are best-effort.
+        use std::sync::Mutex;
+        use std::time::Instant as StdInstant;
+
+        static CACHED: Mutex<(Option<u64>, Option<StdInstant>)> = Mutex::new((None, None));
+        const CACHE_TTL: Duration = Duration::from_secs(5);
+
+        let mut cache = CACHED.lock().ok()?;
+        if let (Some(val), Some(ts)) = *cache {
+            if ts.elapsed() < CACHE_TTL {
+                return Some(val);
+            }
+        }
+
         let output = std::process::Command::new("ps")
             .args(["-o", "rss=", "-p", &std::process::id().to_string()])
             .output()
@@ -155,7 +177,9 @@ fn get_rss() -> Option<u64> {
             .trim()
             .parse::<u64>()
             .ok()?;
-        Some(rss_kb * 1024)
+        let rss_bytes = rss_kb * 1024;
+        *cache = (Some(rss_bytes), Some(StdInstant::now()));
+        Some(rss_bytes)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -175,6 +199,7 @@ struct DeadlineEntry {
     submitted_at: Instant,
     phase: Arc<std::sync::atomic::AtomicU8>,
     latency_tracker: Option<Arc<LatencyTracker>>,
+    inflight_count: Option<usize>,
 }
 
 // ─── Timeout Watchdog ────────────────────────────────────────────────────────
@@ -221,6 +246,7 @@ impl TimeoutWatchdog {
         command: &'static str,
         node: Arc<str>,
         latency_tracker: Option<Arc<LatencyTracker>>,
+        inflight_count: Option<usize>,
     ) -> (oneshot::Receiver<TimeoutEvent>, Arc<std::sync::atomic::AtomicU8>) {
         let (sender, rx) = oneshot::channel();
         let submitted_at = Instant::now();
@@ -236,6 +262,7 @@ impl TimeoutWatchdog {
             submitted_at,
             phase,
             latency_tracker,
+            inflight_count,
         });
 
         (rx, phase_clone)
@@ -355,6 +382,7 @@ impl TimeoutWatchdog {
             recent_p99_latency: recent_p99,
             rss_bytes,
             suggested_timeout,
+            inflight_count: entry.inflight_count,
         }
     }
 
@@ -408,12 +436,7 @@ mod tests {
     async fn fires_with_diagnostic_event() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(
-            Duration::from_millis(50),
-            "GET",
-            node.clone(),
-            None,
-        );
+        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
 
         let event = rx.await.unwrap();
@@ -429,12 +452,7 @@ mod tests {
     async fn does_not_fire_before_deadline() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (mut rx, _phase) = watchdog.register(
-            Duration::from_millis(200),
-            "GET",
-            node.clone(),
-            None,
-        );
+        let (mut rx, _phase) = watchdog.register(Duration::from_millis(200), "GET", node.clone(), None, None);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
     }
@@ -443,8 +461,8 @@ mod tests {
     async fn multiple_deadlines_fire_in_order() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx1, phase1) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None);
-        let (rx2, phase2) = watchdog.register(Duration::from_millis(60), "SET", node.clone(), None);
+        let (rx1, phase1) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None, None);
+        let (rx2, phase2) = watchdog.register(Duration::from_millis(60), "SET", node.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase1);
         TimeoutWatchdog::mark_sent(&phase2);
 
@@ -462,7 +480,7 @@ mod tests {
     async fn cancelled_before_deadline_does_not_fire() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, _phase) = watchdog.register(Duration::from_millis(200), "GET", node.clone(), None);
+        let (rx, _phase) = watchdog.register(Duration::from_millis(200), "GET", node.clone(), None, None);
         // Drop the receiver — simulates command completing before timeout
         drop(rx);
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -475,7 +493,7 @@ mod tests {
     async fn phase_defaults_to_queued() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, _phase) = watchdog.register(Duration::from_millis(30), "SET", node.clone(), None);
+        let (rx, _phase) = watchdog.register(Duration::from_millis(30), "SET", node.clone(), None, None);
         // Don't call mark_sent
 
         let event = rx.await.unwrap();
@@ -486,7 +504,7 @@ mod tests {
     async fn phase_transitions_to_sent() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "SET", node.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(30), "SET", node.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
 
         let event = rx.await.unwrap();
@@ -498,7 +516,7 @@ mod tests {
         // Phase transitions after registration but before fire should be captured
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(80), "SET", node.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(80), "SET", node.clone(), None, None);
 
         // Transition after 30ms (before the 80ms deadline)
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -514,7 +532,7 @@ mod tests {
     async fn classifies_client_backpressure_when_queued() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, _phase) = watchdog.register(Duration::from_millis(30), "SET", node.clone(), None);
+        let (rx, _phase) = watchdog.register(Duration::from_millis(30), "SET", node.clone(), None, None);
 
         let event = rx.await.unwrap();
         assert!(matches!(event.cause, TimeoutCause::ClientBackpressure { .. }));
@@ -524,7 +542,7 @@ mod tests {
     async fn classifies_server_unresponsive_single_command() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("10.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
 
         let event = rx.await.unwrap();
@@ -538,12 +556,7 @@ mod tests {
 
         let mut receivers = Vec::new();
         for _ in 0..10 {
-            let (rx, phase) = watchdog.register(
-                Duration::from_millis(50),
-                "GET",
-                node.clone(),
-                None,
-            );
+            let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node.clone(), None, None);
             TimeoutWatchdog::mark_sent(&phase);
             receivers.push(rx);
         }
@@ -563,12 +576,7 @@ mod tests {
         let mut receivers = Vec::new();
         for i in 0..110 {
             let node: Arc<str> = Arc::from(format!("10.0.0.{}:6379", i % 50));
-            let (rx, phase) = watchdog.register(
-                Duration::from_millis(50),
-                "GET",
-                node,
-                None,
-            );
+            let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node, None, None);
             TimeoutWatchdog::mark_sent(&phase);
             receivers.push(rx);
         }
@@ -586,16 +594,16 @@ mod tests {
         let node_b: Arc<str> = Arc::from("10.0.0.2:6379");
 
         // 3 commands to node_a, 2 to node_b, all with same deadline
-        let (rx_target, phase) = watchdog.register(Duration::from_millis(50), "GET", node_a.clone(), None);
+        let (rx_target, phase) = watchdog.register(Duration::from_millis(50), "GET", node_a.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
         let mut _holders = Vec::new();
         for _ in 0..2 {
-            let (rx, p) = watchdog.register(Duration::from_millis(50), "GET", node_a.clone(), None);
+            let (rx, p) = watchdog.register(Duration::from_millis(50), "GET", node_a.clone(), None, None);
             TimeoutWatchdog::mark_sent(&p);
             _holders.push(rx);
         }
         for _ in 0..2 {
-            let (rx, p) = watchdog.register(Duration::from_millis(50), "SET", node_b.clone(), None);
+            let (rx, p) = watchdog.register(Duration::from_millis(50), "SET", node_b.clone(), None, None);
             TimeoutWatchdog::mark_sent(&p);
             _holders.push(rx);
         }
@@ -652,12 +660,7 @@ mod tests {
             tracker.record(Duration::from_millis(i));
         }
 
-        let (rx, phase) = watchdog.register(
-            Duration::from_millis(30),
-            "GET",
-            node.clone(),
-            Some(tracker),
-        );
+        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), Some(tracker), None);
         TimeoutWatchdog::mark_sent(&phase);
 
         let event = rx.await.unwrap();
@@ -679,12 +682,7 @@ mod tests {
             tracker.record(Duration::from_millis(10));
         }
 
-        let (rx, phase) = watchdog.register(
-            Duration::from_millis(20),
-            "GET",
-            node.clone(),
-            Some(tracker),
-        );
+        let (rx, phase) = watchdog.register(Duration::from_millis(20), "GET", node.clone(), Some(tracker), None);
         TimeoutWatchdog::mark_sent(&phase);
 
         let event = rx.await.unwrap();
@@ -705,12 +703,7 @@ mod tests {
             tracker.record(Duration::from_millis(1));
         }
 
-        let (rx, phase) = watchdog.register(
-            Duration::from_millis(30),
-            "GET",
-            node.clone(),
-            Some(tracker),
-        );
+        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), Some(tracker), None);
         TimeoutWatchdog::mark_sent(&phase);
 
         let event = rx.await.unwrap();
@@ -723,7 +716,7 @@ mod tests {
     async fn no_suggested_timeout_without_tracker() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
 
         let event = rx.await.unwrap();
@@ -736,7 +729,7 @@ mod tests {
     async fn rss_is_populated_on_supported_platforms() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
 
         let event = rx.await.unwrap();
@@ -757,12 +750,7 @@ mod tests {
         let start = Instant::now();
         let mut receivers = Vec::with_capacity(10_000);
         for _ in 0..10_000 {
-            let (rx, _) = watchdog.register(
-                Duration::from_secs(60),
-                "GET",
-                node.clone(),
-                None,
-            );
+            let (rx, _) = watchdog.register(Duration::from_secs(60), "GET", node.clone(), None, None);
             receivers.push(rx);
         }
         let elapsed = start.elapsed();
@@ -781,13 +769,13 @@ mod tests {
 
         // Register 1000 timeouts and immediately drop receivers
         for _ in 0..1000 {
-            let (_rx, _) = watchdog.register(Duration::from_secs(1), "GET", node.clone(), None);
+            let (_rx, _) = watchdog.register(Duration::from_secs(1), "GET", node.clone(), None, None);
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Watchdog should still function after cleanup
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "PING", node.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(30), "PING", node.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
         let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
         assert!(result.is_ok(), "Watchdog should still function after cleanup");
@@ -810,6 +798,7 @@ mod tests {
                         "GET",
                         n.clone(),
                         None,
+                        None,
                     );
                     TimeoutWatchdog::mark_sent(&phase);
                     rxs.push(rx);
@@ -831,7 +820,7 @@ mod tests {
     async fn watchdog_fires_under_tokio_starvation() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, _phase) = watchdog.register(Duration::from_millis(100), "PING", node.clone(), None);
+        let (rx, _phase) = watchdog.register(Duration::from_millis(100), "PING", node.clone(), None, None);
 
         let blocker = tokio::spawn(async {
             let start = Instant::now();
@@ -850,7 +839,7 @@ mod tests {
     async fn starvation_produces_diagnostic_event() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, _phase) = watchdog.register(Duration::from_millis(80), "CLUSTER SLOTS", node.clone(), None);
+        let (rx, _phase) = watchdog.register(Duration::from_millis(80), "CLUSTER SLOTS", node.clone(), None, None);
 
         let blocker = tokio::spawn(async {
             let start = Instant::now();
@@ -876,7 +865,7 @@ mod tests {
     async fn timeout_event_is_debug_printable() {
         let watchdog = TimeoutWatchdog::start();
         let node: Arc<str> = Arc::from("127.0.0.1:6379");
-        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(30), "GET", node.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
 
         let event = rx.await.unwrap();

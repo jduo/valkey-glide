@@ -26,7 +26,7 @@ async fn global_watchdog_is_singleton() {
 async fn global_watchdog_fires_timeout() {
     let watchdog = TimeoutWatchdog::global();
     let node: Arc<str> = Arc::from("127.0.0.1:6379");
-    let (rx, phase) = watchdog.register(Duration::from_millis(40), "PING", node.clone(), None);
+    let (rx, phase) = watchdog.register(Duration::from_millis(40), "PING", node.clone(), None, None);
     TimeoutWatchdog::mark_sent(&phase);
 
     let event = rx.await.unwrap();
@@ -44,12 +44,7 @@ async fn command_completes_before_timeout() {
     let node: Arc<str> = Arc::from("10.0.0.1:6379");
     let tracker = Arc::new(LatencyTracker::new(100));
 
-    let (rx, phase) = watchdog.register(
-        Duration::from_millis(200),
-        "GET",
-        node.clone(),
-        Some(tracker.clone()),
-    );
+    let (rx, phase) = watchdog.register(Duration::from_millis(200), "GET", node.clone(), Some(tracker.clone()), None);
     TimeoutWatchdog::mark_sent(&phase);
 
     // Simulate command completing after 50ms
@@ -76,12 +71,7 @@ async fn mixed_completion_and_timeout() {
     // Register 5 commands: first 3 will "complete", last 2 will timeout
     let mut timeout_receivers = Vec::new();
     for i in 0..5 {
-        let (rx, phase) = watchdog.register(
-            Duration::from_millis(100),
-            "GET",
-            node.clone(),
-            Some(tracker.clone()),
-        );
+        let (rx, phase) = watchdog.register(Duration::from_millis(100), "GET", node.clone(), Some(tracker.clone()), None);
         TimeoutWatchdog::mark_sent(&phase);
         if i < 3 {
             // Simulate completion
@@ -115,12 +105,12 @@ async fn multi_node_timeout_classification() {
 
     let mut receivers = Vec::new();
     for _ in 0..3 {
-        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node_a.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node_a.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
         receivers.push(rx);
     }
     for _ in 0..3 {
-        let (rx, phase) = watchdog.register(Duration::from_millis(50), "SET", node_b.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(50), "SET", node_b.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
         receivers.push(rx);
     }
@@ -141,12 +131,12 @@ async fn single_node_dominates_pending() {
     // 8 commands to bad_node, 2 to good_node
     let mut receivers = Vec::new();
     for _ in 0..8 {
-        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", bad_node.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", bad_node.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
         receivers.push(rx);
     }
     for _ in 0..2 {
-        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", good_node.clone(), None);
+        let (rx, phase) = watchdog.register(Duration::from_millis(50), "GET", good_node.clone(), None, None);
         TimeoutWatchdog::mark_sent(&phase);
         receivers.push(rx);
     }
@@ -173,12 +163,7 @@ async fn shared_tracker_across_commands() {
     }
 
     // Now a command times out — should see the accumulated p99
-    let (rx, phase) = watchdog.register(
-        Duration::from_millis(30),
-        "HGETALL",
-        node.clone(),
-        Some(tracker.clone()),
-    );
+    let (rx, phase) = watchdog.register(Duration::from_millis(30), "HGETALL", node.clone(), Some(tracker.clone()), None);
     TimeoutWatchdog::mark_sent(&phase);
 
     let event = rx.await.unwrap();
@@ -222,7 +207,7 @@ async fn actual_elapsed_accuracy() {
     let watchdog = TimeoutWatchdog::start();
     let node: Arc<str> = Arc::from("127.0.0.1:6379");
     let start = Instant::now();
-    let (rx, phase) = watchdog.register(Duration::from_millis(75), "GET", node.clone(), None);
+    let (rx, phase) = watchdog.register(Duration::from_millis(75), "GET", node.clone(), None, None);
     TimeoutWatchdog::mark_sent(&phase);
 
     let event = rx.await.unwrap();
@@ -243,7 +228,7 @@ async fn configured_timeout_matches_registration() {
     let watchdog = TimeoutWatchdog::start();
     let node: Arc<str> = Arc::from("127.0.0.1:6379");
     let timeout = Duration::from_millis(42);
-    let (rx, phase) = watchdog.register(timeout, "SET", node.clone(), None);
+    let (rx, phase) = watchdog.register(timeout, "SET", node.clone(), None, None);
     TimeoutWatchdog::mark_sent(&phase);
 
     let event = rx.await.unwrap();
@@ -260,12 +245,12 @@ async fn watchdog_survives_rapid_register_cancel_cycles() {
 
     // Rapid register + cancel (simulates fast commands)
     for _ in 0..5000 {
-        let (rx, _) = watchdog.register(Duration::from_secs(10), "GET", node.clone(), None);
+        let (rx, _) = watchdog.register(Duration::from_secs(10), "GET", node.clone(), None, None);
         drop(rx);
     }
 
     // Now register one that should actually fire
-    let (rx, phase) = watchdog.register(Duration::from_millis(30), "PING", node.clone(), None);
+    let (rx, phase) = watchdog.register(Duration::from_millis(30), "PING", node.clone(), None, None);
     TimeoutWatchdog::mark_sent(&phase);
 
     let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
@@ -279,7 +264,7 @@ async fn watchdog_survives_rapid_register_cancel_cycles() {
 async fn zero_duration_timeout_fires_immediately() {
     let watchdog = TimeoutWatchdog::start();
     let node: Arc<str> = Arc::from("127.0.0.1:6379");
-    let (rx, phase) = watchdog.register(Duration::from_millis(0), "GET", node.clone(), None);
+    let (rx, phase) = watchdog.register(Duration::from_millis(0), "GET", node.clone(), None, None);
     TimeoutWatchdog::mark_sent(&phase);
 
     let result = tokio::time::timeout(Duration::from_millis(100), rx).await;
@@ -293,11 +278,11 @@ async fn long_timeout_doesnt_block_short() {
     let node: Arc<str> = Arc::from("127.0.0.1:6379");
 
     // Register a 10-second timeout first
-    let (_long_rx, _) = watchdog.register(Duration::from_secs(10), "SLOWLOG", node.clone(), None);
+    let (_long_rx, _) = watchdog.register(Duration::from_secs(10), "SLOWLOG", node.clone(), None, None);
 
     // Then a 50ms timeout — should fire on time
     let start = Instant::now();
-    let (short_rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node.clone(), None);
+    let (short_rx, phase) = watchdog.register(Duration::from_millis(50), "GET", node.clone(), None, None);
     TimeoutWatchdog::mark_sent(&phase);
 
     let event = short_rx.await.unwrap();
