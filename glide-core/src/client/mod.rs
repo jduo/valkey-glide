@@ -1159,6 +1159,7 @@ impl Client {
                                     execute.await
                                 }
                                 Ok(event) => {
+                                    #[allow(clippy::int_plus_one)]
                                     log_warn_rate_limited!(
                                         "timeout_watchdog",
                                         1,
