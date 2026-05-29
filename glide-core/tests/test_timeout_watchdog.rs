@@ -308,3 +308,55 @@ async fn long_timeout_doesnt_block_short() {
     );
     assert_eq!(event.command, "GET");
 }
+
+// ─── End-to-End Watchdog Wiring Test ─────────────────────────────────────────
+
+/// Verifies the full diagnostic pipeline by simulating what send_command does:
+/// register → attach handle to Cmd → on_sent (simulating try_cmd_request) →
+/// timeout fires → event has correct fields.
+#[tokio::test]
+async fn end_to_end_send_command_simulation() {
+    let watchdog = TimeoutWatchdog::start();
+    let tracker = Arc::new(LatencyTracker::new(100));
+
+    // Simulate 50 successful commands to populate the tracker
+    for _ in 0..50 {
+        tracker.record(Duration::from_millis(5));
+    }
+
+    // Simulate send_command: register with watchdog
+    let (timeout_rx, handle) = watchdog.register(
+        Duration::from_millis(50),
+        "GET",
+        Some(tracker.clone()),
+        Some(42),
+        None,
+        0,
+    );
+
+    // Simulate try_cmd_request: routing resolves, mark as sent
+    handle.mark_sent("10.0.0.5:6379");
+
+    // Simulate a retry
+    use redis::DiagnosticHandle;
+    handle.on_retry();
+
+    // Wait for timeout to fire
+    let event = timeout_rx.await.unwrap();
+
+    // Verify all fields are correctly populated
+    assert_eq!(event.command, "GET");
+    assert_eq!(event.node.as_ref(), "10.0.0.5:6379");
+    assert_eq!(event.phase, CommandPhase::Sent);
+    assert!(event.actual_elapsed >= Duration::from_millis(50));
+    assert_eq!(event.configured_timeout, Duration::from_millis(50));
+    assert_eq!(event.inflight_at_register, Some(42));
+    assert_eq!(event.retry_count, 1);
+    assert!(event.recent_p99_latency.is_some());
+    assert!(event.suggested_timeout.is_some());
+    // Cause should be ServerUnresponsive (single command, sent, low pending)
+    assert!(matches!(
+        event.cause,
+        TimeoutCause::ServerUnresponsive { .. }
+    ));
+}
