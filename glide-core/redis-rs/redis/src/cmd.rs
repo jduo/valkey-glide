@@ -711,10 +711,7 @@ impl Cmd {
 
     /// Attach a diagnostic handle for timeout watchdog.
     #[inline]
-    pub fn set_diagnostic_handle(
-        &mut self,
-        handle: std::sync::Arc<dyn DiagnosticHandle>,
-    ) {
+    pub fn set_diagnostic_handle(&mut self, handle: std::sync::Arc<dyn DiagnosticHandle>) {
         self.diagnostic_handle = Some(handle);
     }
 
