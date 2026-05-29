@@ -224,11 +224,7 @@ async fn actual_elapsed_accuracy() {
     let wall_elapsed = start.elapsed();
 
     // The event's actual_elapsed should be close to wall clock
-    let diff = if event.actual_elapsed > wall_elapsed {
-        event.actual_elapsed - wall_elapsed
-    } else {
-        wall_elapsed - event.actual_elapsed
-    };
+    let diff = event.actual_elapsed.abs_diff(wall_elapsed);
     assert!(
         diff < Duration::from_millis(20),
         "Elapsed drift too high: {:?}",
