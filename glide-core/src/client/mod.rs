@@ -1159,9 +1159,10 @@ impl Client {
                                     execute.await
                                 }
                                 Ok(event) => {
-                                    log_warn(
+                                    log_warn_rate_limited!(
                                         "timeout_watchdog",
-                                        event.to_string(),
+                                        1,
+                                        event.to_string()
                                     );
                                     if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
                                         log_error(

@@ -54,6 +54,8 @@ pub struct Cmd {
 pub trait DiagnosticHandle: Send + Sync {
     /// Called when the command has been routed and sent to a specific node.
     fn on_sent(&self, node_address: &str);
+    /// Called when the command is being retried. Default no-op.
+    fn on_retry(&self) {}
 }
 
 /// The PING command used to fence other commands for ordering guarantees

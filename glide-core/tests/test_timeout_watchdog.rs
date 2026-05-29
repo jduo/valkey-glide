@@ -6,9 +6,7 @@
 //! behavior: concurrent commands, mixed nodes, latency tracking across
 //! command lifecycles, and interaction with the global singleton.
 
-use glide_core::timeout_watchdog::{
-    CommandPhase, LatencyTracker, TimeoutCause, TimeoutWatchdog,
-};
+use glide_core::timeout_watchdog::{CommandPhase, LatencyTracker, TimeoutCause, TimeoutWatchdog};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,7 +40,14 @@ async fn command_completes_before_timeout() {
     let watchdog = TimeoutWatchdog::start();
     let tracker = Arc::new(LatencyTracker::new(100));
 
-    let (rx, handle) = watchdog.register(Duration::from_millis(200), "GET", Some(tracker.clone()), None, None, 0);
+    let (rx, handle) = watchdog.register(
+        Duration::from_millis(200),
+        "GET",
+        Some(tracker.clone()),
+        None,
+        None,
+        0,
+    );
     handle.mark_sent("127.0.0.1:6379");
 
     // Simulate command completing after 50ms
@@ -68,7 +73,14 @@ async fn mixed_completion_and_timeout() {
     // Register 5 commands: first 3 will "complete", last 2 will timeout
     let mut timeout_receivers = Vec::new();
     for i in 0..5 {
-        let (rx, handle) = watchdog.register(Duration::from_millis(100), "GET", Some(tracker.clone()), None, None, 0);
+        let (rx, handle) = watchdog.register(
+            Duration::from_millis(100),
+            "GET",
+            Some(tracker.clone()),
+            None,
+            None,
+            0,
+        );
         handle.mark_sent("127.0.0.1:6379");
         if i < 3 {
             // Simulate completion
@@ -155,7 +167,14 @@ async fn shared_tracker_across_commands() {
     }
 
     // Now a command times out — should see the accumulated p99
-    let (rx, handle) = watchdog.register(Duration::from_millis(30), "HGETALL", Some(tracker.clone()), None, None, 0);
+    let (rx, handle) = watchdog.register(
+        Duration::from_millis(30),
+        "HGETALL",
+        Some(tracker.clone()),
+        None,
+        None,
+        0,
+    );
     handle.mark_sent("127.0.0.1:6379");
 
     let event = rx.await.unwrap();
@@ -210,7 +229,11 @@ async fn actual_elapsed_accuracy() {
     } else {
         wall_elapsed - event.actual_elapsed
     };
-    assert!(diff < Duration::from_millis(20), "Elapsed drift too high: {:?}", diff);
+    assert!(
+        diff < Duration::from_millis(20),
+        "Elapsed drift too high: {:?}",
+        diff
+    );
 }
 
 /// Configured timeout in the event matches what was registered.
@@ -256,7 +279,10 @@ async fn zero_duration_timeout_fires_immediately() {
     handle.mark_sent("127.0.0.1:6379");
 
     let result = tokio::time::timeout(Duration::from_millis(100), rx).await;
-    assert!(result.is_ok(), "Zero-duration timeout should fire immediately");
+    assert!(
+        result.is_ok(),
+        "Zero-duration timeout should fire immediately"
+    );
 }
 
 /// Very long timeout doesn't block other shorter timeouts.
@@ -269,11 +295,16 @@ async fn long_timeout_doesnt_block_short() {
 
     // Then a 50ms timeout — should fire on time
     let start = Instant::now();
-    let (short_rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
+    let (short_rx, handle) =
+        watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
     handle.mark_sent("127.0.0.1:6379");
 
     let event = short_rx.await.unwrap();
     let elapsed = start.elapsed();
-    assert!(elapsed < Duration::from_millis(150), "Short timeout blocked: {:?}", elapsed);
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "Short timeout blocked: {:?}",
+        elapsed
+    );
     assert_eq!(event.command, "GET");
 }

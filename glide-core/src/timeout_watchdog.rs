@@ -6,9 +6,9 @@
 //! Mutex on the command path.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -21,6 +21,7 @@ use tokio::sync::oneshot;
 pub struct WatchdogHandle {
     pub(crate) phase: AtomicU8,
     pub(crate) node: std::sync::OnceLock<Arc<str>>,
+    pub(crate) retry_count: AtomicU8,
 }
 
 impl WatchdogHandle {
@@ -28,6 +29,7 @@ impl WatchdogHandle {
         Self {
             phase: AtomicU8::new(PHASE_QUEUED),
             node: std::sync::OnceLock::new(),
+            retry_count: AtomicU8::new(0),
         }
     }
 
@@ -44,6 +46,9 @@ impl redis::DiagnosticHandle for WatchdogHandle {
     fn on_sent(&self, node_address: &str) {
         self.mark_sent(node_address);
     }
+    fn on_retry(&self) {
+        self.retry_count.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Resolve a command name from raw bytes to a &'static str without allocation.
@@ -52,62 +57,150 @@ pub fn cmd_name_from_bytes(bytes: &[u8]) -> &'static str {
     // Compare case-insensitively against common commands
     match bytes.len() {
         2 => match_upper(bytes, &[(b"EX", "EX")]),
-        3 => match_upper(bytes, &[
-            (b"GET", "GET"), (b"SET", "SET"), (b"DEL", "DEL"), (b"TTL", "TTL"),
-            (b"ACL", "ACL"),
-        ]),
-        4 => match_upper(bytes, &[
-            (b"PING", "PING"), (b"MGET", "MGET"), (b"MSET", "MSET"), (b"INCR", "INCR"),
-            (b"DECR", "DECR"), (b"HGET", "HGET"), (b"HSET", "HSET"), (b"HDEL", "HDEL"),
-            (b"HLEN", "HLEN"), (b"LLEN", "LLEN"), (b"LPOS", "LPOS"), (b"LPOP", "LPOP"),
-            (b"RPOP", "RPOP"), (b"SADD", "SADD"), (b"SREM", "SREM"), (b"ZADD", "ZADD"),
-            (b"ZREM", "ZREM"), (b"KEYS", "KEYS"), (b"SCAN", "SCAN"), (b"TYPE", "TYPE"),
-            (b"INFO", "INFO"), (b"WAIT", "WAIT"), (b"DUMP", "DUMP"), (b"COPY", "COPY"),
-            (b"SORT", "SORT"), (b"EVAL", "EVAL"), (b"ECHO", "ECHO"), (b"AUTH", "AUTH"),
-            (b"XADD", "XADD"), (b"XLEN", "XLEN"), (b"PTTL", "PTTL"),
-        ]),
-        5 => match_upper(bytes, &[
-            (b"LPUSH", "LPUSH"), (b"RPUSH", "RPUSH"), (b"HKEYS", "HKEYS"),
-            (b"HVALS", "HVALS"), (b"SCARD", "SCARD"), (b"ZCARD", "ZCARD"),
-            (b"WATCH", "WATCH"), (b"MULTI", "MULTI"), (b"XREAD", "XREAD"),
-            (b"GETEX", "GETEX"), (b"SETEX", "SETEX"), (b"SETNX", "SETNX"),
-            (b"HMGET", "HMGET"), (b"HMSET", "HMSET"),
-        ]),
-        6 => match_upper(bytes, &[
-            (b"APPEND", "APPEND"), (b"EXISTS", "EXISTS"), (b"EXPIRE", "EXPIRE"),
-            (b"INCRBY", "INCRBY"), (b"DECRBY", "DECRBY"), (b"LPUSHX", "LPUSHX"),
-            (b"RPUSHX", "RPUSHX"), (b"LRANGE", "LRANGE"), (b"LINDEX", "LINDEX"),
-            (b"HSETNX", "HSETNX"), (b"SMOVE", "SMOVE"), (b"SUBSTR", "SUBSTR"),
-            (b"STRLEN", "STRLEN"), (b"SELECT", "SELECT"), (b"DBSIZE", "DBSIZE"),
-            (b"OBJECT", "OBJECT"), (b"CONFIG", "CONFIG"), (b"SCRIPT", "SCRIPT"),
-            (b"PUBSUB", "PUBSUB"), (b"XRANGE", "XRANGE"), (b"GETDEL", "GETDEL"),
-            (b"GETSET", "GETSET"), (b"RENAME", "RENAME"), (b"UNLINK", "UNLINK"),
-        ]),
-        7 => match_upper(bytes, &[
-            (b"HGETALL", "HGETALL"), (b"LINSERT", "LINSERT"), (b"PERSIST", "PERSIST"),
-            (b"PUBLISH", "PUBLISH"), (b"CLUSTER", "CLUSTER"), (b"EVALSHA", "EVALSHA"),
-            (b"RESTORE", "RESTORE"), (b"FLUSHDB", "FLUSHDB"), (b"PEXPIRE", "PEXPIRE"),
-        ]),
-        8 => match_upper(bytes, &[
-            (b"EXPIREAT", "EXPIREAT"), (b"BITCOUNT", "BITCOUNT"),
-            (b"BITFIELD", "BITFIELD"), (b"FLUSHALL", "FLUSHALL"),
-            (b"GETRANGE", "GETRANGE"), (b"SETRANGE", "SETRANGE"),
-        ]),
-        9 => match_upper(bytes, &[
-            (b"PEXPIREAT", "PEXPIREAT"), (b"SUBSCRIBE", "SUBSCRIBE"),
-            (b"RANDOMKEY", "RANDOMKEY"),
-        ]),
-        10 => match_upper(bytes, &[
-            (b"PSUBSCRIBE", "PSUBSCRIBE"), (b"SINTERCARD", "SINTERCARD"),
-            (b"XREADGROUP", "XREADGROUP"),
-        ]),
-        11 => match_upper(bytes, &[
-            (b"UNSUBSCRIBE", "UNSUBSCRIBE"), (b"INCRBYFLOAT", "INCRBYFLOAT"),
-            (b"ZRANGESTORE", "ZRANGESTORE"),
-        ]),
-        12 => match_upper(bytes, &[
-            (b"PUNSUBSCRIBE", "PUNSUBSCRIBE"),
-        ]),
+        3 => match_upper(
+            bytes,
+            &[
+                (b"GET", "GET"),
+                (b"SET", "SET"),
+                (b"DEL", "DEL"),
+                (b"TTL", "TTL"),
+                (b"ACL", "ACL"),
+            ],
+        ),
+        4 => match_upper(
+            bytes,
+            &[
+                (b"PING", "PING"),
+                (b"MGET", "MGET"),
+                (b"MSET", "MSET"),
+                (b"INCR", "INCR"),
+                (b"DECR", "DECR"),
+                (b"HGET", "HGET"),
+                (b"HSET", "HSET"),
+                (b"HDEL", "HDEL"),
+                (b"HLEN", "HLEN"),
+                (b"LLEN", "LLEN"),
+                (b"LPOS", "LPOS"),
+                (b"LPOP", "LPOP"),
+                (b"RPOP", "RPOP"),
+                (b"SADD", "SADD"),
+                (b"SREM", "SREM"),
+                (b"ZADD", "ZADD"),
+                (b"ZREM", "ZREM"),
+                (b"KEYS", "KEYS"),
+                (b"SCAN", "SCAN"),
+                (b"TYPE", "TYPE"),
+                (b"INFO", "INFO"),
+                (b"WAIT", "WAIT"),
+                (b"DUMP", "DUMP"),
+                (b"COPY", "COPY"),
+                (b"SORT", "SORT"),
+                (b"EVAL", "EVAL"),
+                (b"ECHO", "ECHO"),
+                (b"AUTH", "AUTH"),
+                (b"XADD", "XADD"),
+                (b"XLEN", "XLEN"),
+                (b"PTTL", "PTTL"),
+            ],
+        ),
+        5 => match_upper(
+            bytes,
+            &[
+                (b"LPUSH", "LPUSH"),
+                (b"RPUSH", "RPUSH"),
+                (b"HKEYS", "HKEYS"),
+                (b"HVALS", "HVALS"),
+                (b"SCARD", "SCARD"),
+                (b"ZCARD", "ZCARD"),
+                (b"WATCH", "WATCH"),
+                (b"MULTI", "MULTI"),
+                (b"XREAD", "XREAD"),
+                (b"GETEX", "GETEX"),
+                (b"SETEX", "SETEX"),
+                (b"SETNX", "SETNX"),
+                (b"HMGET", "HMGET"),
+                (b"HMSET", "HMSET"),
+                (b"SMOVE", "SMOVE"),
+            ],
+        ),
+        6 => match_upper(
+            bytes,
+            &[
+                (b"APPEND", "APPEND"),
+                (b"EXISTS", "EXISTS"),
+                (b"EXPIRE", "EXPIRE"),
+                (b"INCRBY", "INCRBY"),
+                (b"DECRBY", "DECRBY"),
+                (b"LPUSHX", "LPUSHX"),
+                (b"RPUSHX", "RPUSHX"),
+                (b"LRANGE", "LRANGE"),
+                (b"LINDEX", "LINDEX"),
+                (b"HSETNX", "HSETNX"),
+                (b"SUBSTR", "SUBSTR"),
+                (b"STRLEN", "STRLEN"),
+                (b"SELECT", "SELECT"),
+                (b"DBSIZE", "DBSIZE"),
+                (b"OBJECT", "OBJECT"),
+                (b"CONFIG", "CONFIG"),
+                (b"SCRIPT", "SCRIPT"),
+                (b"PUBSUB", "PUBSUB"),
+                (b"XRANGE", "XRANGE"),
+                (b"GETDEL", "GETDEL"),
+                (b"GETSET", "GETSET"),
+                (b"RENAME", "RENAME"),
+                (b"UNLINK", "UNLINK"),
+            ],
+        ),
+        7 => match_upper(
+            bytes,
+            &[
+                (b"HGETALL", "HGETALL"),
+                (b"LINSERT", "LINSERT"),
+                (b"PERSIST", "PERSIST"),
+                (b"PUBLISH", "PUBLISH"),
+                (b"CLUSTER", "CLUSTER"),
+                (b"EVALSHA", "EVALSHA"),
+                (b"RESTORE", "RESTORE"),
+                (b"FLUSHDB", "FLUSHDB"),
+                (b"PEXPIRE", "PEXPIRE"),
+            ],
+        ),
+        8 => match_upper(
+            bytes,
+            &[
+                (b"EXPIREAT", "EXPIREAT"),
+                (b"BITCOUNT", "BITCOUNT"),
+                (b"BITFIELD", "BITFIELD"),
+                (b"FLUSHALL", "FLUSHALL"),
+                (b"GETRANGE", "GETRANGE"),
+                (b"SETRANGE", "SETRANGE"),
+            ],
+        ),
+        9 => match_upper(
+            bytes,
+            &[
+                (b"PEXPIREAT", "PEXPIREAT"),
+                (b"SUBSCRIBE", "SUBSCRIBE"),
+                (b"RANDOMKEY", "RANDOMKEY"),
+            ],
+        ),
+        10 => match_upper(
+            bytes,
+            &[
+                (b"PSUBSCRIBE", "PSUBSCRIBE"),
+                (b"SINTERCARD", "SINTERCARD"),
+                (b"XREADGROUP", "XREADGROUP"),
+            ],
+        ),
+        11 => match_upper(
+            bytes,
+            &[
+                (b"UNSUBSCRIBE", "UNSUBSCRIBE"),
+                (b"INCRBYFLOAT", "INCRBYFLOAT"),
+                (b"ZRANGESTORE", "ZRANGESTORE"),
+            ],
+        ),
+        12 => match_upper(bytes, &[(b"PUNSUBSCRIBE", "PUNSUBSCRIBE")]),
         _ => None,
     }
     .unwrap_or("UNKNOWN")
@@ -135,9 +228,7 @@ pub enum CommandPhase {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimeoutCause {
     /// Command was sent but the server didn't respond in time.
-    ServerUnresponsive {
-        node: Arc<str>,
-    },
+    ServerUnresponsive { node: Arc<str> },
     /// Command never left the client — Tokio or connection pool bottleneck.
     ClientBackpressure {
         queue_depth: usize,
@@ -184,6 +275,8 @@ pub struct TimeoutEvent {
     pub inflight_at_register: Option<usize>,
     /// Number of inflight requests when the timeout fired.
     pub inflight_at_timeout: Option<usize>,
+    /// Number of retries attempted before this timeout.
+    pub retry_count: u8,
 }
 
 impl std::fmt::Display for TimeoutEvent {
@@ -192,11 +285,20 @@ impl std::fmt::Display for TimeoutEvent {
             f,
             "Timeout: cmd={} node={} cause={:?} phase={:?} \
              elapsed={:?} configured={:?}",
-            self.command, self.node, self.cause, self.phase,
-            self.actual_elapsed, self.configured_timeout,
+            self.command,
+            self.node,
+            self.cause,
+            self.phase,
+            self.actual_elapsed,
+            self.configured_timeout,
         )?;
-        write!(f, " pending={} same_node={}", self.pending_commands, self.same_node_pending)?;
-        if let (Some(at_reg), Some(at_fire)) = (self.inflight_at_register, self.inflight_at_timeout) {
+        write!(
+            f,
+            " pending={} same_node={}",
+            self.pending_commands, self.same_node_pending
+        )?;
+        if let (Some(at_reg), Some(at_fire)) = (self.inflight_at_register, self.inflight_at_timeout)
+        {
             let trend = if at_fire > at_reg + 10 {
                 "BUILDING (backpressure increasing during timeout window)"
             } else if at_reg > at_fire + 10 {
@@ -211,6 +313,9 @@ impl std::fmt::Display for TimeoutEvent {
         }
         if let Some(suggested) = self.suggested_timeout {
             write!(f, " suggested_timeout={:?}", suggested)?;
+        }
+        if self.retry_count > 0 {
+            write!(f, " retries={}", self.retry_count)?;
         }
         Ok(())
     }
@@ -252,9 +357,11 @@ impl LatencyTracker {
         let micros = latency.as_micros() as u64;
         let idx = self.write_idx.fetch_add(1, Ordering::Relaxed) % self.capacity;
         self.samples[idx].store(micros, Ordering::Release);
-        let _ = self.count.fetch_update(Ordering::Release, Ordering::Relaxed, |c| {
-            if c < self.capacity { Some(c + 1) } else { None }
-        });
+        let _ = self
+            .count
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |c| {
+                if c < self.capacity { Some(c + 1) } else { None }
+            });
     }
 
     /// Compute p99 from the ring buffer. Called only at fire time (rare).
@@ -526,9 +633,11 @@ impl TimeoutWatchdog {
             rss_bytes,
             suggested_timeout,
             inflight_at_register: entry.inflight_at_register,
-            inflight_at_timeout: entry.inflight_counter.as_ref().map(|counter| {
-                (entry.inflight_limit - counter.load(Ordering::Relaxed)) as usize
-            }),
+            inflight_at_timeout: entry
+                .inflight_counter
+                .as_ref()
+                .map(|counter| (entry.inflight_limit - counter.load(Ordering::Relaxed)) as usize),
+            retry_count: entry.handle.retry_count.load(Ordering::Relaxed),
         }
     }
 
@@ -596,7 +705,8 @@ mod tests {
     #[tokio::test]
     async fn does_not_fire_before_deadline() {
         let watchdog = TimeoutWatchdog::start();
-        let (mut rx, _handle) = watchdog.register(Duration::from_millis(200), "GET", None, None, None, 0);
+        let (mut rx, _handle) =
+            watchdog.register(Duration::from_millis(200), "GET", None, None, None, 0);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
     }
@@ -604,8 +714,10 @@ mod tests {
     #[tokio::test]
     async fn multiple_deadlines_fire_in_order() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx1, handle1) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
-        let (rx2, handle2) = watchdog.register(Duration::from_millis(60), "SET", None, None, None, 0);
+        let (rx1, handle1) =
+            watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
+        let (rx2, handle2) =
+            watchdog.register(Duration::from_millis(60), "SET", None, None, None, 0);
         handle1.mark_sent("127.0.0.1:6379");
         handle2.mark_sent("127.0.0.1:6379");
 
@@ -622,7 +734,8 @@ mod tests {
     #[tokio::test]
     async fn cancelled_before_deadline_does_not_fire() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(200), "GET", None, None, None, 0);
+        let (rx, _handle) =
+            watchdog.register(Duration::from_millis(200), "GET", None, None, None, 0);
         // Drop the receiver — simulates command completing before timeout
         drop(rx);
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -634,7 +747,8 @@ mod tests {
     #[tokio::test]
     async fn phase_defaults_to_queued() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "SET", None, None, None, 0);
+        let (rx, _handle) =
+            watchdog.register(Duration::from_millis(30), "SET", None, None, None, 0);
         // Don't call mark_sent
 
         let event = rx.await.unwrap();
@@ -670,10 +784,14 @@ mod tests {
     #[tokio::test]
     async fn classifies_client_backpressure_when_queued() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "SET", None, None, None, 0);
+        let (rx, _handle) =
+            watchdog.register(Duration::from_millis(30), "SET", None, None, None, 0);
 
         let event = rx.await.unwrap();
-        assert!(matches!(event.cause, TimeoutCause::ClientBackpressure { .. }));
+        assert!(matches!(
+            event.cause,
+            TimeoutCause::ClientBackpressure { .. }
+        ));
     }
 
     #[tokio::test]
@@ -683,7 +801,10 @@ mod tests {
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
-        assert!(matches!(event.cause, TimeoutCause::ServerUnresponsive { .. }));
+        assert!(matches!(
+            event.cause,
+            TimeoutCause::ServerUnresponsive { .. }
+        ));
     }
 
     #[tokio::test]
@@ -692,7 +813,8 @@ mod tests {
 
         let mut receivers = Vec::new();
         for _ in 0..10 {
-            let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
+            let (rx, handle) =
+                watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
             handle.mark_sent("10.0.0.1:6379");
             receivers.push(rx);
         }
@@ -711,7 +833,8 @@ mod tests {
         // Register >100 commands across different nodes
         let mut receivers = Vec::new();
         for i in 0..110 {
-            let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
+            let (rx, handle) =
+                watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
             handle.mark_sent(&format!("10.0.0.{}:6379", i % 50));
             receivers.push(rx);
         }
@@ -727,7 +850,8 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
 
         // 3 commands to node_a, 2 to node_b, all with same deadline
-        let (rx_target, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
+        let (rx_target, handle) =
+            watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
         handle.mark_sent("10.0.0.1:6379");
         let mut _holders = Vec::new();
         for _ in 0..2 {
@@ -792,7 +916,14 @@ mod tests {
             tracker.record(Duration::from_millis(i));
         }
 
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", Some(tracker), None, None, 0);
+        let (rx, handle) = watchdog.register(
+            Duration::from_millis(30),
+            "GET",
+            Some(tracker),
+            None,
+            None,
+            0,
+        );
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -813,7 +944,14 @@ mod tests {
             tracker.record(Duration::from_millis(10));
         }
 
-        let (rx, handle) = watchdog.register(Duration::from_millis(20), "GET", Some(tracker), None, None, 0);
+        let (rx, handle) = watchdog.register(
+            Duration::from_millis(20),
+            "GET",
+            Some(tracker),
+            None,
+            None,
+            0,
+        );
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -833,7 +971,14 @@ mod tests {
             tracker.record(Duration::from_millis(1));
         }
 
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", Some(tracker), None, None, 0);
+        let (rx, handle) = watchdog.register(
+            Duration::from_millis(30),
+            "GET",
+            Some(tracker),
+            None,
+            None,
+            0,
+        );
         handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
@@ -901,10 +1046,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Watchdog should still function after cleanup
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "PING", None, None, None, 0);
+        let (rx, handle) =
+            watchdog.register(Duration::from_millis(30), "PING", None, None, None, 0);
         handle.mark_sent("127.0.0.1:6379");
         let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
-        assert!(result.is_ok(), "Watchdog should still function after cleanup");
+        assert!(
+            result.is_ok(),
+            "Watchdog should still function after cleanup"
+        );
     }
 
     #[tokio::test]
@@ -917,14 +1066,8 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let mut rxs = Vec::new();
                 for _ in 0..100 {
-                    let (rx, handle) = w.register(
-                        Duration::from_millis(50),
-                        "GET",
-                        None,
-                        None,
-                        None,
-                        0,
-                    );
+                    let (rx, handle) =
+                        w.register(Duration::from_millis(50), "GET", None, None, None, 0);
                     handle.mark_sent("127.0.0.1:6379");
                     rxs.push(rx);
                 }
@@ -944,7 +1087,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn watchdog_fires_under_tokio_starvation() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(100), "PING", None, None, None, 0);
+        let (rx, _handle) =
+            watchdog.register(Duration::from_millis(100), "PING", None, None, None, 0);
 
         let blocker = tokio::spawn(async {
             let start = Instant::now();
@@ -955,14 +1099,24 @@ mod tests {
         });
 
         let result = tokio::time::timeout(Duration::from_secs(1), rx).await;
-        assert!(result.is_ok(), "Watchdog should fire despite Tokio starvation");
+        assert!(
+            result.is_ok(),
+            "Watchdog should fire despite Tokio starvation"
+        );
         blocker.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn starvation_produces_diagnostic_event() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(80), "CLUSTER SLOTS", None, None, None, 0);
+        let (rx, _handle) = watchdog.register(
+            Duration::from_millis(80),
+            "CLUSTER SLOTS",
+            None,
+            None,
+            None,
+            0,
+        );
 
         let blocker = tokio::spawn(async {
             let start = Instant::now();
@@ -977,7 +1131,10 @@ mod tests {
         let event = result.unwrap().unwrap();
         // Command was never sent (Tokio couldn't schedule it)
         assert_eq!(event.phase, CommandPhase::Queued);
-        assert!(matches!(event.cause, TimeoutCause::ClientBackpressure { .. }));
+        assert!(matches!(
+            event.cause,
+            TimeoutCause::ClientBackpressure { .. }
+        ));
         assert_eq!(event.command, "CLUSTER SLOTS");
         blocker.abort();
     }
@@ -1062,13 +1219,17 @@ mod tests {
         // If routing never completes (e.g., connection failure), phase stays Queued
         // and node is "unknown"
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
+        let (rx, _handle) =
+            watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
         // Don't call mark_sent — simulates routing failure
 
         let event = rx.await.unwrap();
         assert_eq!(event.phase, CommandPhase::Queued);
         assert_eq!(event.node.as_ref(), "unknown");
-        assert!(matches!(event.cause, TimeoutCause::ClientBackpressure { .. }));
+        assert!(matches!(
+            event.cause,
+            TimeoutCause::ClientBackpressure { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1076,8 +1237,12 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         let inflight_allowed = Arc::new(AtomicIsize::new(958)); // 1000 - 42 = 958 remaining
         let (rx, handle) = watchdog.register(
-            Duration::from_millis(30), "GET", None, Some(42),
-            Some(inflight_allowed.clone()), 1000,
+            Duration::from_millis(30),
+            "GET",
+            None,
+            Some(42),
+            Some(inflight_allowed.clone()),
+            1000,
         );
         handle.mark_sent("127.0.0.1:6379");
 
