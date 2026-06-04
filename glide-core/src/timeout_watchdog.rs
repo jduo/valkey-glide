@@ -669,9 +669,20 @@ impl TimeoutWatchdog {
     /// Watchdog thread main loop.
     fn run(rx: mpsc::Receiver<DeadlineEntry>) {
         let mut deadlines: BTreeMap<Instant, Vec<DeadlineEntry>> = BTreeMap::new();
+        let mut last_cleanup = Instant::now();
 
         loop {
             let now = Instant::now();
+
+            // Periodic cleanup of entries whose receivers were dropped (command completed)
+            // Run at most once per second to amortize cost
+            if now.duration_since(last_cleanup) > Duration::from_secs(1) {
+                deadlines.retain(|_, entries| {
+                    entries.retain(|e| !e.sender.is_closed());
+                    !entries.is_empty()
+                });
+                last_cleanup = now;
+            }
 
             // Fire all expired deadlines
             while let Some(entry) = deadlines.first_entry() {
@@ -751,10 +762,17 @@ impl TimeoutWatchdog {
         let node = entry.handle.node.get().unwrap_or(unknown).clone();
 
         // Count pending commands (total and same-node)
+        // Bounded scan to avoid O(n) stall during timeout storms
         let mut pending_total = 0usize;
         let mut same_node_pending = 0usize;
-        for entries in deadlines.values() {
+        const MAX_SCAN: usize = 1024;
+        let mut scanned = 0;
+        'outer: for entries in deadlines.values() {
             for e in entries {
+                if scanned >= MAX_SCAN {
+                    break 'outer;
+                }
+                scanned += 1;
                 if !e.sender.is_closed() {
                     pending_total += 1;
                     let e_node = e.handle.node.get().unwrap_or(unknown);
