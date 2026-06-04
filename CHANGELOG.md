@@ -2,13 +2,21 @@
 
 #### Changes
 * CORE: Extend timeout watchdog with structured diagnostics. Timeouts now report classified root cause (ServerUnresponsive, ClientBackpressure, NodeDegraded, SystemOverload), command name, target node, phase (Queued vs Sent), inflight trend, per-client p99 latency, and suggested timeout. Adds DiagnosticHandle trait to redis-rs for routing-layer integration. ([#6044](https://github.com/valkey-io/valkey-glide/pull/6044))
+* Core, Python, Java, Node, Go: Add `CLIENT PAUSE` and `CLIENT UNPAUSE` command support ([#6035](https://github.com/valkey-io/valkey-glide/issues/6035))
+* Go: Add RESET command support ([#5946](https://github.com/valkey-io/valkey-glide/pull/5946))
+* Java: Add RESET command support ([#5947](https://github.com/valkey-io/valkey-glide/pull/5947))
+* CORE/FFI: Add `MonitorClient` for the MONITOR command ([#5977](https://github.com/valkey-io/valkey-glide/pull/5977))
+* Node: Add RESET command support ([#5945](https://github.com/valkey-io/valkey-glide/pull/5945))
+* Python: Add RESET command support ([#5944](https://github.com/valkey-io/valkey-glide/pull/5944))
 * Python: Add `MIGRATE` command support ([#5933](https://github.com/valkey-io/valkey-glide/pull/5933))
-* CORE: Phase 2 client-side caching - server-assisted invalidation via CLIENT TRACKING ([#5962](https://github.com/valkey-io/valkey-glide/pull/5962))
-* CORE: Add RESET command support — track and reset connection state (database index, client name, protocol, pubsub subscriptions) on RESET; route RESET to all nodes in cluster mode ([#5959](https://github.com/valkey-io/valkey-glide/pull/5959))
+* CORE: Phase 2 client-side caching ([#5962](https://github.com/valkey-io/valkey-glide/pull/5962))
+* CORE: Add RESET command support ([#5959](https://github.com/valkey-io/valkey-glide/pull/5959))
 * Node: Support custom socket address resolution when connecting to valkey ([#5873](https://github.com/valkey-io/valkey-glide/issues/5873))
 * Node: Add `MIGRATE` command support ([#5934](https://github.com/valkey-io/valkey-glide/pull/5934))
 * Go: Support custom socket address resolution when connecting to valkey ([#5873](https://github.com/valkey-io/valkey-glide/issues/5873))
 * Go: Add `MIGRATE` command support ([#5935](https://github.com/valkey-io/valkey-glide/pull/5935))
+* CORE: Avoid panic on cluster `SCAN` when a read-from-replica AZ affinity strategy is configured. The slot map carries no AZ metadata, so these strategies now fall back to their documented round-robin behavior (replicas for `AZAffinity`, replicas plus primary for `AZAffinityReplicasAndPrimary`) instead of hitting `todo!()` ([#5909](https://github.com/valkey-io/valkey-glide/issues/5909))
+* FFI: Add `client_side_cache` configuration to the URI-based client creation API (`create_client_from_uri`) — supports `max_cache_kb`, `entry_ttl_ms`, `eviction_policy` (LRU/LFU), and `enable_metrics` via JSON options; `cache_id` is auto-generated internally ([#5860](https://github.com/valkey-io/valkey-glide/pull/5860))
 
 ## 2.4
 

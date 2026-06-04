@@ -3,6 +3,8 @@ package glide.api;
 
 import static command_request.CommandRequestOuterClass.RequestType.ClientGetName;
 import static command_request.CommandRequestOuterClass.RequestType.ClientId;
+import static command_request.CommandRequestOuterClass.RequestType.ClientPause;
+import static command_request.CommandRequestOuterClass.RequestType.ClientUnpause;
 import static command_request.CommandRequestOuterClass.RequestType.ConfigGet;
 import static command_request.CommandRequestOuterClass.RequestType.ConfigResetStat;
 import static command_request.CommandRequestOuterClass.RequestType.ConfigRewrite;
@@ -26,6 +28,7 @@ import static command_request.CommandRequestOuterClass.RequestType.LastSave;
 import static command_request.CommandRequestOuterClass.RequestType.Lolwut;
 import static command_request.CommandRequestOuterClass.RequestType.Ping;
 import static command_request.CommandRequestOuterClass.RequestType.RandomKey;
+import static command_request.CommandRequestOuterClass.RequestType.Reset;
 import static command_request.CommandRequestOuterClass.RequestType.Scan;
 import static command_request.CommandRequestOuterClass.RequestType.Select;
 import static command_request.CommandRequestOuterClass.RequestType.Time;
@@ -46,6 +49,7 @@ import glide.api.commands.TransactionsCommands;
 import glide.api.models.Batch;
 import glide.api.models.GlideString;
 import glide.api.models.Transaction;
+import glide.api.models.commands.ClientPauseMode;
 import glide.api.models.commands.FlushMode;
 import glide.api.models.commands.InfoOptions.Section;
 import glide.api.models.commands.batch.BatchOptions;
@@ -215,6 +219,31 @@ public class GlideClient extends BaseClient
     public CompletableFuture<String> select(long index) {
         return commandManager.submitNewCommand(
                 Select, new String[] {Long.toString(index)}, this::handleStringResponse);
+    }
+
+    @Override
+    public CompletableFuture<String> clientPause(long timeout) {
+        return commandManager.submitNewCommand(
+                ClientPause, new String[] {Long.toString(timeout)}, this::handleStringResponse);
+    }
+
+    @Override
+    public CompletableFuture<String> clientPause(long timeout, @NonNull ClientPauseMode mode) {
+        return commandManager.submitNewCommand(
+                ClientPause,
+                new String[] {Long.toString(timeout), mode.getValkeyApi()},
+                this::handleStringResponse);
+    }
+
+    @Override
+    public CompletableFuture<String> clientUnpause() {
+        return commandManager.submitNewCommand(
+                ClientUnpause, new String[0], this::handleStringResponse);
+    }
+
+    @Override
+    public CompletableFuture<String> reset() {
+        return commandManager.submitNewCommand(Reset, new String[0], this::handleStringResponse);
     }
 
     @Override
