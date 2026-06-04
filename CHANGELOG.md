@@ -1,6 +1,7 @@
 ## Pending 2.5
 
 #### Changes
+* CORE: Extend timeout watchdog with structured diagnostics. Timeouts now report classified root cause (ServerUnresponsive, ClientBackpressure, NodeDegraded, SystemOverload), command name, target node, phase (Queued vs Sent), inflight trend, per-client p99 latency, and suggested timeout. Adds DiagnosticHandle trait to redis-rs for routing-layer integration. ([#6044](https://github.com/valkey-io/valkey-glide/pull/6044))
 * Python: Add `MIGRATE` command support ([#5933](https://github.com/valkey-io/valkey-glide/pull/5933))
 * CORE: Phase 2 client-side caching - server-assisted invalidation via CLIENT TRACKING ([#5962](https://github.com/valkey-io/valkey-glide/pull/5962))
 * CORE: Add RESET command support — track and reset connection state (database index, client name, protocol, pubsub subscriptions) on RESET; route RESET to all nodes in cluster mode ([#5959](https://github.com/valkey-io/valkey-glide/pull/5959))
