@@ -688,10 +688,24 @@ impl TimeoutWatchdog {
                 }
             }
 
-            // Drain new registrations
-            while let Ok(entry) = rx.try_recv() {
-                if !entry.sender.is_closed() {
-                    deadlines.entry(entry.deadline).or_default().push(entry);
+            // Drain new registrations (bounded to prevent starvation of deadline firing)
+            const MAX_DRAIN_BATCH: usize = 256;
+            for _ in 0..MAX_DRAIN_BATCH {
+                match rx.try_recv() {
+                    Ok(entry) => {
+                        if !entry.sender.is_closed() {
+                            deadlines.entry(entry.deadline).or_default().push(entry);
+                        }
+                    }
+                    Err(_) => break,
+                }
+                // If a deadline is now due, stop draining and go fire it
+                if deadlines
+                    .keys()
+                    .next()
+                    .is_some_and(|d| *d <= Instant::now())
+                {
+                    break;
                 }
             }
 
