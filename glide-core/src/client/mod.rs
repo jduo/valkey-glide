@@ -2552,7 +2552,7 @@ impl Client {
                 db_namespace: "0".to_string(),
             },
             client_side_cache: None,
-latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(64)),
+            latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(64)),
             circuit_breaker: None,
         }
     }
@@ -2851,7 +2851,7 @@ mod tests {
                 db_namespace: "0".to_string(),
             },
             client_side_cache: None,
-latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(64)),
+            latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(64)),
             circuit_breaker: None,
         }
     }

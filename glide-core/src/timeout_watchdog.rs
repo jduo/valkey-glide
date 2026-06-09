@@ -16,28 +16,48 @@ use tokio::sync::oneshot;
 
 /// Handle shared between the caller and the watchdog. Allows the routing layer
 /// to update the node address and mark the command as sent after connection
-/// resolution, without any allocation on the hot path.
+/// resolution.
+///
+/// Also carries per-client diagnostic context (latency tracker, inflight counter)
+/// that is set once at construction and only read at fire time. This avoids
+/// cloning Arc references into the DeadlineEntry on every command.
 #[derive(Debug)]
 pub struct WatchdogHandle {
     pub(crate) phase: AtomicU8,
-    pub(crate) node: std::sync::OnceLock<Arc<str>>,
+    pub(crate) node: std::sync::OnceLock<String>,
     pub(crate) retry_count: AtomicU8,
+    /// Per-client latency tracker. Set at construction, read at fire time.
+    latency_tracker: Option<Arc<LatencyTracker>>,
+    /// Per-client inflight counter. Set at construction, read at fire time.
+    inflight_counter: Option<Arc<AtomicIsize>>,
+    /// Per-client inflight limit. Set at construction, read at fire time.
+    inflight_limit: isize,
 }
 
 impl WatchdogHandle {
-    fn new() -> Self {
+    fn new(
+        latency_tracker: Option<Arc<LatencyTracker>>,
+        inflight_counter: Option<Arc<AtomicIsize>>,
+        inflight_limit: isize,
+    ) -> Self {
         Self {
             phase: AtomicU8::new(PHASE_QUEUED),
             node: std::sync::OnceLock::new(),
             retry_count: AtomicU8::new(0),
+            latency_tracker,
+            inflight_counter,
+            inflight_limit,
         }
     }
 
     /// Mark the command as sent and record the resolved node address.
     /// Called from the routing layer after connection resolution.
+    /// Only allocates a String for the node address (unavoidable since the
+    /// address is borrowed from the connection). The Arc promotion is deferred
+    /// to fire time.
     #[inline]
     pub fn mark_sent(&self, node_address: &str) {
-        let _ = self.node.set(Arc::from(node_address));
+        let _ = self.node.set(node_address.to_owned());
         self.phase.store(PHASE_SENT, Ordering::Release);
     }
 }
@@ -533,10 +553,25 @@ impl LatencyTracker {
 
 // ─── System Diagnostics ──────────────────────────────────────────────────────
 
+/// Returns the process RSS in bytes. Cached for 5 seconds on both Linux and macOS
+/// to avoid repeated syscalls on the watchdog thread during timeout storms.
 fn get_rss() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string("/proc/self/status")
+        use std::sync::Mutex;
+        use std::time::Instant as StdInstant;
+
+        static CACHED: Mutex<(Option<u64>, Option<StdInstant>)> = Mutex::new((None, None));
+        const CACHE_TTL: Duration = Duration::from_secs(5);
+
+        let mut cache = CACHED.lock().ok()?;
+        if let (Some(val), Some(ts)) = *cache
+            && ts.elapsed() < CACHE_TTL
+        {
+            return Some(val);
+        }
+
+        let rss_bytes = std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|s| {
                 s.lines()
@@ -547,7 +582,10 @@ fn get_rss() -> Option<u64> {
                             .and_then(|v| v.parse::<u64>().ok())
                     })
                     .map(|kb| kb * 1024) // convert to bytes
-            })
+            });
+
+        *cache = (rss_bytes, Some(StdInstant::now()));
+        rss_bytes
     }
     #[cfg(target_os = "macos")]
     {
@@ -558,10 +596,10 @@ fn get_rss() -> Option<u64> {
         const CACHE_TTL: Duration = Duration::from_secs(5);
 
         let mut cache = CACHED.lock().ok()?;
-        if let (Some(val), Some(ts)) = *cache {
-            if ts.elapsed() < CACHE_TTL {
-                return Some(val);
-            }
+        if let (Some(val), Some(ts)) = *cache
+            && ts.elapsed() < CACHE_TTL
+        {
+            return Some(val);
         }
 
         let output = std::process::Command::new("ps")
@@ -585,17 +623,15 @@ fn get_rss() -> Option<u64> {
 // ─── Deadline Entry ──────────────────────────────────────────────────────────
 
 /// Internal entry sent from callers to the watchdog thread.
+/// Kept minimal to reduce per-command channel overhead. Diagnostic context
+/// (latency tracker, inflight counter) lives on the WatchdogHandle instead.
 struct DeadlineEntry {
     deadline: Instant,
     sender: oneshot::Sender<TimeoutEvent>,
-    // Diagnostic metadata (cheap to attach at register time):
     command: &'static str,
     handle: Arc<WatchdogHandle>,
     submitted_at: Instant,
-    latency_tracker: Option<Arc<LatencyTracker>>,
     inflight_at_register: Option<usize>,
-    inflight_counter: Option<Arc<AtomicIsize>>,
-    inflight_limit: isize,
 }
 
 // ─── Timeout Watchdog ────────────────────────────────────────────────────────
@@ -609,6 +645,11 @@ pub struct TimeoutWatchdog {
 
 /// Global singleton watchdog instance.
 static GLOBAL_WATCHDOG: std::sync::OnceLock<TimeoutWatchdog> = std::sync::OnceLock::new();
+
+/// Sentinel node address used when routing never completed.
+/// Static to avoid repeated allocations at fire time.
+static UNKNOWN_NODE: std::sync::LazyLock<Arc<str>> =
+    std::sync::LazyLock::new(|| Arc::from("unknown"));
 
 /// Atomic phase value constants.
 const PHASE_QUEUED: u8 = 0;
@@ -634,7 +675,9 @@ impl TimeoutWatchdog {
     /// - A `oneshot::Receiver<TimeoutEvent>` that resolves with diagnostics if the deadline fires
     /// - A `WatchdogHandle` that the routing layer uses to mark the command as sent and record the node
     ///
-    /// This is the hot path — only cheap copies here.
+    /// Per-client diagnostic context (latency tracker, inflight counter) is stored
+    /// on the handle — not sent through the channel — eliminating Arc clones from
+    /// the hot path.
     #[inline]
     pub fn register(
         &self,
@@ -647,7 +690,11 @@ impl TimeoutWatchdog {
     ) -> (oneshot::Receiver<TimeoutEvent>, Arc<WatchdogHandle>) {
         let (sender, rx) = oneshot::channel();
         let submitted_at = Instant::now();
-        let handle = Arc::new(WatchdogHandle::new());
+        let handle = Arc::new(WatchdogHandle::new(
+            latency_tracker,
+            inflight_counter,
+            inflight_limit,
+        ));
         let handle_clone = handle.clone();
         let deadline = submitted_at + timeout;
 
@@ -657,10 +704,7 @@ impl TimeoutWatchdog {
             command,
             handle,
             submitted_at,
-            latency_tracker,
             inflight_at_register: inflight_count,
-            inflight_counter,
-            inflight_limit,
         });
 
         (rx, handle_clone)
@@ -670,6 +714,7 @@ impl TimeoutWatchdog {
     fn run(rx: mpsc::Receiver<DeadlineEntry>) {
         let mut deadlines: BTreeMap<Instant, Vec<DeadlineEntry>> = BTreeMap::new();
         let mut last_cleanup = Instant::now();
+        let mut last_full_diagnostic = Instant::now() - Duration::from_secs(1); // allow first fire
 
         loop {
             let now = Instant::now();
@@ -694,7 +739,18 @@ impl TimeoutWatchdog {
                     if e.sender.is_closed() {
                         continue; // Command completed before timeout
                     }
-                    let event = Self::build_event(&e, &deadlines);
+                    // Rate-limit full diagnostics: at most once per 100ms window.
+                    // During a timeout storm many deadlines fire at once; running
+                    // build_event (with its scan + syscall) for every single one
+                    // would stall the watchdog thread and delay subsequent timeout
+                    // delivery — the exact failure mode the watchdog exists to prevent.
+                    let event =
+                        if now.duration_since(last_full_diagnostic) >= Duration::from_millis(100) {
+                            last_full_diagnostic = now;
+                            Self::build_event(&e, &deadlines)
+                        } else {
+                            Self::build_bare_event(&e)
+                        };
                     let _ = e.sender.send(event);
                 }
             }
@@ -740,7 +796,59 @@ impl TimeoutWatchdog {
         }
     }
 
-    /// Build a TimeoutEvent with diagnostics. Only called at fire time (rare).
+    /// Build a lightweight TimeoutEvent without expensive diagnostics (no scan,
+    /// no syscall). Used during timeout storms when a full diagnostic was emitted
+    /// recently. Still provides phase, node, command name, and elapsed time.
+    fn build_bare_event(entry: &DeadlineEntry) -> TimeoutEvent {
+        let now = Instant::now();
+        let actual_elapsed = now.duration_since(entry.submitted_at);
+        let configured_timeout = entry.deadline.duration_since(entry.submitted_at);
+
+        let phase_val = entry.handle.phase.load(Ordering::Acquire);
+        let phase = if phase_val == PHASE_SENT {
+            CommandPhase::Sent
+        } else {
+            CommandPhase::Queued
+        };
+
+        let node: Arc<str> = entry
+            .handle
+            .node
+            .get()
+            .map(|s| Arc::from(s.as_str()))
+            .unwrap_or_else(|| UNKNOWN_NODE.clone());
+
+        let cause = if phase == CommandPhase::Queued {
+            TimeoutCause::ClientBackpressure {
+                queue_depth: 0,
+                scheduling_delay: actual_elapsed,
+            }
+        } else {
+            TimeoutCause::ServerUnresponsive { node: node.clone() }
+        };
+
+        TimeoutEvent {
+            cause,
+            command: entry.command,
+            node,
+            phase,
+            configured_timeout,
+            actual_elapsed,
+            pending_commands: 0,
+            same_node_pending: 0,
+            recent_p99_latency: None,
+            rss_bytes: None,
+            suggested_timeout: None,
+            inflight_at_register: entry.inflight_at_register,
+            inflight_at_timeout: entry.handle.inflight_counter.as_ref().map(|counter| {
+                (entry.handle.inflight_limit - counter.load(Ordering::Relaxed)) as usize
+            }),
+            retry_count: entry.handle.retry_count.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Build a TimeoutEvent with full diagnostics. Only called at fire time (rare),
+    /// and rate-limited to at most once per 100ms window.
     fn build_event(
         entry: &DeadlineEntry,
         deadlines: &BTreeMap<Instant, Vec<DeadlineEntry>>,
@@ -756,10 +864,13 @@ impl TimeoutWatchdog {
             CommandPhase::Queued
         };
 
-        // Resolve node: use the address set by try_cmd_request, or "unknown"
-        static UNKNOWN_NODE: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
-        let unknown = UNKNOWN_NODE.get_or_init(|| Arc::from("unknown"));
-        let node = entry.handle.node.get().unwrap_or(unknown).clone();
+        // Resolve node: convert the stored String to Arc<str> only at fire time.
+        let node: Arc<str> = entry
+            .handle
+            .node
+            .get()
+            .map(|s| Arc::from(s.as_str()))
+            .unwrap_or_else(|| UNKNOWN_NODE.clone());
 
         // Count pending commands (total and same-node)
         // Bounded scan to avoid O(n) stall during timeout storms
@@ -775,15 +886,16 @@ impl TimeoutWatchdog {
                 scanned += 1;
                 if !e.sender.is_closed() {
                     pending_total += 1;
-                    let e_node = e.handle.node.get().unwrap_or(unknown);
-                    if *e_node == node {
+                    if let Some(e_node) = e.handle.node.get()
+                        && e_node.as_str() == node.as_ref()
+                    {
                         same_node_pending += 1;
                     }
                 }
             }
         }
 
-        let recent_p99 = entry.latency_tracker.as_ref().and_then(|t| t.p99());
+        let recent_p99 = entry.handle.latency_tracker.as_ref().and_then(|t| t.p99());
         let rss_bytes = get_rss();
 
         // Classify the cause
@@ -813,10 +925,9 @@ impl TimeoutWatchdog {
             rss_bytes,
             suggested_timeout,
             inflight_at_register: entry.inflight_at_register,
-            inflight_at_timeout: entry
-                .inflight_counter
-                .as_ref()
-                .map(|counter| (entry.inflight_limit - counter.load(Ordering::Relaxed)) as usize),
+            inflight_at_timeout: entry.handle.inflight_counter.as_ref().map(|counter| {
+                (entry.handle.inflight_limit - counter.load(Ordering::Relaxed)) as usize
+            }),
             retry_count: entry.handle.retry_count.load(Ordering::Relaxed),
         }
     }
@@ -1367,7 +1478,7 @@ mod tests {
         retrieved.on_sent("192.168.1.1:6379");
 
         // Verify the original handle was updated
-        assert_eq!(handle.node.get().unwrap().as_ref(), "192.168.1.1:6379");
+        assert_eq!(handle.node.get().unwrap().as_str(), "192.168.1.1:6379");
         assert_eq!(handle.phase.load(Ordering::Acquire), PHASE_SENT);
     }
 
