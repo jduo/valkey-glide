@@ -1,5 +1,6 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
+pub mod circuit_breaker;
 mod types;
 
 use crate::cluster_scan_container::insert_cluster_scan_cursor;
@@ -322,6 +323,8 @@ pub struct Client {
     client_side_cache: Option<Arc<dyn GlideCache>>,
     // Per-client latency tracker for timeout diagnostics
     latency_tracker: Arc<crate::timeout_watchdog::LatencyTracker>,
+    // Optional Client-wide circuit breaker
+    circuit_breaker: Option<Arc<circuit_breaker::ClientCircuitBreaker>>,
 }
 
 async fn run_with_timeout<T>(
@@ -1045,6 +1048,14 @@ impl Client {
 
             let client = self.get_or_initialize_client().await?;
 
+            // Reject immediately if circuit breaker is open.
+            if !self.is_circuit_breaker_healthy() {
+                return Err(RedisError::from((
+                    ErrorKind::CircuitBreakerOpen,
+                    "Client circuit breaker is open - core unhealthy",
+                )));
+            }
+
             if let Some(result) = self.pubsub_synchronizer.intercept_pubsub_command(cmd).await {
                 return result;
             }
@@ -1106,7 +1117,7 @@ impl Client {
             let self_clone = self.clone();
             let mut owned_cmd = cmd.clone();
 
-            match request_timeout {
+            let result = match request_timeout {
                 Some(duration) => {
                     // Resolve command name from raw bytes (zero allocation)
                     let cmd_name = owned_cmd
@@ -1189,7 +1200,40 @@ impl Client {
                     );
                     execute.await
                 }
+            };
+
+            // Report result to client-wide circuit breaker
+            if let Some(cb) = &self.circuit_breaker {
+                let (is_error, error_kind) = match result.as_ref() {
+                    Ok(_) => (false, None),
+                    Err(e) => {
+                        let counts = if e.is_timeout() {
+                            cb.counts_timeouts()
+                        } else {
+                            matches!(
+                                e.kind(),
+                                ErrorKind::IoError
+                                    | ErrorKind::FatalSendError
+                                    | ErrorKind::FatalReceiveError
+                            ) || e.is_connection_dropped()
+                        };
+                        if counts {
+                            let kind_str = match e.kind() {
+                                ErrorKind::IoError => "IoError",
+                                ErrorKind::FatalSendError => "FatalSendError",
+                                ErrorKind::FatalReceiveError => "FatalReceiveError",
+                                _ => "Timeout",
+                            };
+                            (true, Some(kind_str))
+                        } else {
+                            (false, None)
+                        }
+                    }
+                };
+                cb.on_result(is_error, error_kind);
             }
+
+            result
         })
     }
 
@@ -1581,6 +1625,17 @@ impl Client {
     /// the number of commands currently held by the internal pipeline.
     pub fn available_inflight_count(&self) -> isize {
         self.inflight_requests_allowed.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if the client-wide circuit breaker allows requests.
+    /// If CB is not configured, always returns true.
+    /// Fast path (Closed state) is a single atomic load. Open state may acquire a lock
+    /// to check if transition to HalfOpen is needed.
+    #[inline]
+    pub fn is_circuit_breaker_healthy(&self) -> bool {
+        self.circuit_breaker
+            .as_ref()
+            .is_none_or(|cb| cb.is_healthy())
     }
 
     /// Update the password used to authenticate with the servers.
@@ -2281,6 +2336,39 @@ impl Client {
                 otel_metadata,
                 client_side_cache,
                 latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(4096)),
+                circuit_breaker: request.client_circuit_breaker.as_ref().map(|config| {
+                    let defaults = circuit_breaker::ClientCircuitBreakerConfig::default();
+                    Arc::new(circuit_breaker::ClientCircuitBreaker::new(
+                        circuit_breaker::ClientCircuitBreakerConfig {
+                            window_size: Duration::from_millis(if config.window_size_ms > 0 {
+                                config.window_size_ms as u64
+                            } else {
+                                defaults.window_size.as_millis() as u64
+                            }),
+                            failure_rate_threshold: if config.failure_rate_threshold > 0.0 {
+                                config.failure_rate_threshold
+                            } else {
+                                defaults.failure_rate_threshold
+                            },
+                            min_errors: if config.min_errors > 0 {
+                                config.min_errors
+                            } else {
+                                defaults.min_errors
+                            },
+                            open_timeout: Duration::from_millis(if config.open_timeout_ms > 0 {
+                                config.open_timeout_ms as u64
+                            } else {
+                                defaults.open_timeout.as_millis() as u64
+                            }),
+                            count_timeouts: config.count_timeouts,
+                            consecutive_successes: if config.consecutive_successes > 0 {
+                                config.consecutive_successes
+                            } else {
+                                defaults.consecutive_successes
+                            },
+                        },
+                    ))
+                }),
             };
 
             let client_arc = Arc::new(RwLock::new(client));
@@ -2464,7 +2552,8 @@ impl Client {
                 db_namespace: "0".to_string(),
             },
             client_side_cache: None,
-            latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(64)),
+latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(64)),
+            circuit_breaker: None,
         }
     }
 }
@@ -2762,7 +2851,8 @@ mod tests {
                 db_namespace: "0".to_string(),
             },
             client_side_cache: None,
-            latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(64)),
+latency_tracker: Arc::new(crate::timeout_watchdog::LatencyTracker::new(64)),
+            circuit_breaker: None,
         }
     }
 
