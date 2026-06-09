@@ -827,6 +827,10 @@ impl TimeoutWatchdog {
             TimeoutCause::ServerUnresponsive { node: node.clone() }
         };
 
+        // p99() is a cheap sort over the ring buffer — no syscall, no scan.
+        let recent_p99 = entry.handle.latency_tracker.as_ref().and_then(|t| t.p99());
+        let suggested_timeout = recent_p99.map(|p99| (p99 * 3).max(configured_timeout));
+
         TimeoutEvent {
             cause,
             command: entry.command,
@@ -836,9 +840,9 @@ impl TimeoutWatchdog {
             actual_elapsed,
             pending_commands: 0,
             same_node_pending: 0,
-            recent_p99_latency: None,
+            recent_p99_latency: recent_p99,
             rss_bytes: None,
-            suggested_timeout: None,
+            suggested_timeout,
             inflight_at_register: entry.inflight_at_register,
             inflight_at_timeout: entry.handle.inflight_counter.as_ref().map(|counter| {
                 (entry.handle.inflight_limit - counter.load(Ordering::Relaxed)) as usize
