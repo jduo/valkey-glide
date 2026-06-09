@@ -5,10 +5,12 @@
 ### Fixes
 
 * Core: Honor `AWS_ENDPOINT_URL_STS` in the IAM credentials-provider loader so ElastiCache/MemoryDB IAM auth works in AWS partitions that do not publish a separate FIPS STS hostname (e.g. `us-gov-west-1`). Previously, setting `AWS_USE_FIPS_ENDPOINT=true` made the SDK construct a non-existent `sts-fips.<region>.amazonaws.com`, causing credential acquisition to hang. Matches `boto3` behavior. ([#5967](https://github.com/valkey-io/valkey-glide/issues/5967))
+* Core: Make the pipeline send-timeout liveness-aware so sustained backpressure on a live-but-slow connection waits for channel capacity instead of failing commands with `FatalSendError`, while a genuinely dead connection still fails fast ([#5446](https://github.com/valkey-io/valkey-glide/issues/5446))
 
 ### Changes
 
 * CORE: Extend timeout watchdog with structured diagnostics. Timeouts now report classified root cause (ServerUnresponsive, ClientBackpressure, NodeDegraded, SystemOverload), command name, target node, phase (Queued vs Sent), inflight trend, per-client p99 latency, and suggested timeout. Adds DiagnosticHandle trait to redis-rs for routing-layer integration. ([#6044](https://github.com/valkey-io/valkey-glide/pull/6044))
+* Java: Add `FAILOVER` and `REPLICAOF` command support ([#6170](https://github.com/valkey-io/valkey-glide/pull/6170))
 * CORE, Java, Python, Node, Go: Add client-wide circuit breaker that detects sustained error rates and rejects requests at the FFI boundary before threads park. Opt-in via `ClientCircuitBreakerConfiguration`. Tracks error rate in a sliding window, trips when threshold is exceeded, and recovers automatically via optimistic HalfOpen with consecutive success validation. Java additionally performs a synchronous pre-check to prevent thread explosion under `managedBlock()`. ([#5996](https://github.com/valkey-io/valkey-glide/issues/5996))
 * Core, Java: Add `SAVE`, `BGSAVE` and `BGREWRITEAOF` command support ([#6095](https://github.com/valkey-io/valkey-glide/issues/6095))
 * Core, Python, Java, Node, Go: Add `CLIENT PAUSE` and `CLIENT UNPAUSE` command support ([#6035](https://github.com/valkey-io/valkey-glide/issues/6035))
