@@ -86,7 +86,7 @@ async fn pending_count_tracks_registrations() {
     let during = pending_count();
     assert!(
         during >= before + 3,
-        "pending should increase: before={before}, during={during}"
+        "pending should increase by at least 3: before={before}, during={during}"
     );
 
     // Wait for all to fire
@@ -96,9 +96,11 @@ async fn pending_count_tracks_registrations() {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
     let after = pending_count();
+    // Our 3 entries fired, so count should have dropped by at least 3 from peak.
+    // Other parallel tests may add entries, so we can't assert an absolute value.
     assert!(
-        after <= before,
-        "pending should return to baseline: before={before}, after={after}"
+        after <= during - 3,
+        "pending should drop by at least 3 after fire: during={during}, after={after}"
     );
 }
 
