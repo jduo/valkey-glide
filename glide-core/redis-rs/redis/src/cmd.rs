@@ -54,6 +54,12 @@ pub struct Cmd {
 pub trait DiagnosticHandle: Send + Sync {
     /// Called when the command has been routed and sent to a specific node.
     fn on_sent(&self, node_address: &str);
+    /// Called when the command has been routed and sent, with an owned address.
+    /// Default implementation delegates to `on_sent`. Override to avoid
+    /// re-allocating when the caller already has an owned String.
+    fn on_sent_owned(&self, node_address: String) {
+        self.on_sent(&node_address);
+    }
     /// Called when the command is being retried. Default no-op.
     fn on_retry(&self) {}
 }

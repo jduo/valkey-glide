@@ -52,12 +52,19 @@ impl WatchdogHandle {
 
     /// Mark the command as sent and record the resolved node address.
     /// Called from the routing layer after connection resolution.
-    /// Only allocates a String for the node address (unavoidable since the
-    /// address is borrowed from the connection). The Arc promotion is deferred
-    /// to fire time.
+    /// Accepts a borrowed `&str` and clones it. For callers that already have
+    /// an owned `String`, use `mark_sent_owned` to avoid a redundant clone.
     #[inline]
     pub fn mark_sent(&self, node_address: &str) {
         let _ = self.node.set(node_address.to_owned());
+        self.phase.store(PHASE_SENT, Ordering::Release);
+    }
+
+    /// Like `mark_sent` but takes an owned String, avoiding a re-allocation
+    /// when the caller already has one (e.g. standalone `node_address()`).
+    #[inline]
+    pub fn mark_sent_owned(&self, node_address: String) {
+        let _ = self.node.set(node_address);
         self.phase.store(PHASE_SENT, Ordering::Release);
     }
 }
@@ -65,6 +72,9 @@ impl WatchdogHandle {
 impl redis::DiagnosticHandle for WatchdogHandle {
     fn on_sent(&self, node_address: &str) {
         self.mark_sent(node_address);
+    }
+    fn on_sent_owned(&self, node_address: String) {
+        self.mark_sent_owned(node_address);
     }
     fn on_retry(&self) {
         self.retry_count.fetch_add(1, Ordering::Relaxed);
