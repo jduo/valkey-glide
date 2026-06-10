@@ -642,14 +642,16 @@ impl TimeoutWatchdog {
                     break;
                 }
                 let (_, entries) = entry.remove_entry();
+                let mut fired = 0usize;
                 for e in entries {
                     if e.sender.is_closed() {
-                        PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                        fired += 1;
                         continue; // Command completed before timeout
                     }
                     let _ = e.sender.send(());
-                    PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                    fired += 1;
                 }
+                PENDING_COUNT.fetch_sub(fired, Ordering::Relaxed);
             }
 
             // Drain new registrations (bounded to prevent starvation of deadline firing)
@@ -669,7 +671,7 @@ impl TimeoutWatchdog {
                 if deadlines
                     .keys()
                     .next()
-                    .is_some_and(|d| *d <= Instant::now())
+                    .is_some_and(|d| *d <= now)
                 {
                     break;
                 }
