@@ -1115,7 +1115,7 @@ impl Client {
                 None
             };
             let self_clone = self.clone();
-            let mut owned_cmd = cmd.clone();
+            let owned_cmd = cmd.clone();
 
             let result = match request_timeout {
                 Some(duration) => {
@@ -1132,21 +1132,18 @@ impl Client {
                             as usize,
                     );
 
-                    let (timeout_rx, watchdog_handle) =
-                        crate::timeout_watchdog::TimeoutWatchdog::global().register(
-                            duration,
-                            cmd_name,
-                            Some(self.latency_tracker.clone()),
-                            inflight,
-                            Some(self.inflight_requests_allowed.clone()),
-                            self.inflight_requests_limit,
-                        );
-
-                    // Attach handle to Cmd so try_cmd_request can call mark_sent
-                    // after routing resolves the target node address.
-                    owned_cmd.set_diagnostic_handle(watchdog_handle);
-
+                    // Wrap Cmd in Arc BEFORE register so we can pass a Weak reference
                     let owned_cmd = Arc::new(owned_cmd);
+
+                    let timeout_rx = crate::timeout_watchdog::TimeoutWatchdog::global().register(
+                        duration,
+                        cmd_name,
+                        Arc::downgrade(&owned_cmd),
+                        Some(self.latency_tracker.clone()),
+                        inflight,
+                        Some(self.inflight_requests_allowed.clone()),
+                        self.inflight_requests_limit,
+                    );
                     let execute = Self::execute_command_owned(
                         self_clone,
                         owned_cmd,

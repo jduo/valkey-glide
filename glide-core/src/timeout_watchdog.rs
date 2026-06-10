@@ -7,79 +7,16 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 // ─── Public Types ────────────────────────────────────────────────────────────
 
-/// Handle shared between the caller and the watchdog. Allows the routing layer
-/// to update the node address and mark the command as sent after connection
-/// resolution.
-///
-/// Also carries per-client diagnostic context (latency tracker, inflight counter)
-/// that is set once at construction and only read at fire time. This avoids
-/// cloning Arc references into the DeadlineEntry on every command.
-#[derive(Debug)]
-pub struct WatchdogHandle {
-    pub(crate) phase: AtomicU8,
-    pub(crate) node: std::sync::OnceLock<String>,
-    pub(crate) retry_count: AtomicU8,
-    /// Per-client latency tracker. Set at construction, read at fire time.
-    latency_tracker: Option<Arc<LatencyTracker>>,
-    /// Per-client inflight counter. Set at construction, read at fire time.
-    inflight_counter: Option<Arc<AtomicIsize>>,
-    /// Per-client inflight limit. Set at construction, read at fire time.
-    inflight_limit: isize,
-}
-
-impl WatchdogHandle {
-    fn new(
-        latency_tracker: Option<Arc<LatencyTracker>>,
-        inflight_counter: Option<Arc<AtomicIsize>>,
-        inflight_limit: isize,
-    ) -> Self {
-        Self {
-            phase: AtomicU8::new(PHASE_QUEUED),
-            node: std::sync::OnceLock::new(),
-            retry_count: AtomicU8::new(0),
-            latency_tracker,
-            inflight_counter,
-            inflight_limit,
-        }
-    }
-
-    /// Mark the command as sent and record the resolved node address.
-    /// Called from the routing layer after connection resolution.
-    /// Accepts a borrowed `&str` and clones it. For callers that already have
-    /// an owned `String`, use `mark_sent_owned` to avoid a redundant clone.
-    #[inline]
-    pub fn mark_sent(&self, node_address: &str) {
-        let _ = self.node.set(node_address.to_owned());
-        self.phase.store(PHASE_SENT, Ordering::Release);
-    }
-
-    /// Like `mark_sent` but takes an owned String, avoiding a re-allocation
-    /// when the caller already has one (e.g. standalone `node_address()`).
-    #[inline]
-    pub fn mark_sent_owned(&self, node_address: String) {
-        let _ = self.node.set(node_address);
-        self.phase.store(PHASE_SENT, Ordering::Release);
-    }
-}
-
-impl redis::DiagnosticHandle for WatchdogHandle {
-    fn on_sent(&self, node_address: &str) {
-        self.mark_sent(node_address);
-    }
-    fn on_sent_owned(&self, node_address: String) {
-        self.mark_sent_owned(node_address);
-    }
-    fn on_retry(&self) {
-        self.retry_count.fetch_add(1, Ordering::Relaxed);
-    }
-}
+// WatchdogHandle has been removed. Diagnostic state (phase, node, retry_count)
+// now lives inline on redis::Cmd. The watchdog holds a Weak<redis::Cmd> and
+// reads from it at fire time.
 /// Resolve a command name from raw bytes to a &'static str without allocation.
 /// Exhaustive coverage of all commands in the RequestType enum.
 /// Falls back to "UNKNOWN" for unrecognized commands.
@@ -633,15 +570,22 @@ fn get_rss() -> Option<u64> {
 // ─── Deadline Entry ──────────────────────────────────────────────────────────
 
 /// Internal entry sent from callers to the watchdog thread.
-/// Kept minimal to reduce per-command channel overhead. Diagnostic context
-/// (latency tracker, inflight counter) lives on the WatchdogHandle instead.
+/// Holds a Weak<redis::Cmd> to read diagnostic state at fire time.
+/// Per-client diagnostic context (latency tracker, inflight counter) is
+/// stored here since it's set once at registration and only read at fire time.
 struct DeadlineEntry {
     deadline: Instant,
     sender: oneshot::Sender<TimeoutEvent>,
     command: &'static str,
-    handle: Arc<WatchdogHandle>,
+    cmd: std::sync::Weak<redis::Cmd>,
     submitted_at: Instant,
     inflight_at_register: Option<usize>,
+    /// Per-client latency tracker. Set at registration, read at fire time.
+    latency_tracker: Option<Arc<LatencyTracker>>,
+    /// Per-client inflight counter. Set at registration, read at fire time.
+    inflight_counter: Option<Arc<AtomicIsize>>,
+    /// Per-client inflight limit. Set at registration, read at fire time.
+    inflight_limit: isize,
 }
 
 // ─── Timeout Watchdog ────────────────────────────────────────────────────────
@@ -681,43 +625,47 @@ impl TimeoutWatchdog {
         Self { tx }
     }
 
-    /// Register a timeout with diagnostic context. Returns:
-    /// - A `oneshot::Receiver<TimeoutEvent>` that resolves with diagnostics if the deadline fires
-    /// - A `WatchdogHandle` that the routing layer uses to mark the command as sent and record the node
+    /// Register a timeout with diagnostic context. Returns a
+    /// `oneshot::Receiver<TimeoutEvent>` that resolves with diagnostics if the
+    /// deadline fires.
+    ///
+    /// The caller must wrap the `Cmd` in an `Arc` before calling this, and pass
+    /// `Arc::downgrade(&cmd)` as the `cmd` parameter. The watchdog reads
+    /// diagnostic state (phase, node, retry_count) directly from the Cmd at
+    /// fire time. If the Cmd has been dropped (command completed), the entry is
+    /// skipped.
     ///
     /// Per-client diagnostic context (latency tracker, inflight counter) is stored
-    /// on the handle — not sent through the channel — eliminating Arc clones from
-    /// the hot path.
+    /// on the DeadlineEntry — not on the Cmd — to keep the Cmd struct lean.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         timeout: Duration,
         command: &'static str,
+        cmd: std::sync::Weak<redis::Cmd>,
         latency_tracker: Option<Arc<LatencyTracker>>,
         inflight_count: Option<usize>,
         inflight_counter: Option<Arc<AtomicIsize>>,
         inflight_limit: isize,
-    ) -> (oneshot::Receiver<TimeoutEvent>, Arc<WatchdogHandle>) {
+    ) -> oneshot::Receiver<TimeoutEvent> {
         let (sender, rx) = oneshot::channel();
         let submitted_at = Instant::now();
-        let handle = Arc::new(WatchdogHandle::new(
-            latency_tracker,
-            inflight_counter,
-            inflight_limit,
-        ));
-        let handle_clone = handle.clone();
         let deadline = submitted_at + timeout;
 
         let _ = self.tx.send(DeadlineEntry {
             deadline,
             sender,
             command,
-            handle,
+            cmd,
             submitted_at,
             inflight_at_register: inflight_count,
+            latency_tracker,
+            inflight_counter,
+            inflight_limit,
         });
 
-        (rx, handle_clone)
+        rx
     }
 
     /// Watchdog thread main loop.
@@ -814,19 +762,26 @@ impl TimeoutWatchdog {
         let actual_elapsed = now.duration_since(entry.submitted_at);
         let configured_timeout = entry.deadline.duration_since(entry.submitted_at);
 
-        let phase_val = entry.handle.phase.load(Ordering::Acquire);
+        // Try to read diagnostic state from the Cmd. If the Arc was dropped
+        // (command completed), use defaults.
+        let (phase_val, node, retry_count) = if let Some(cmd) = entry.cmd.upgrade() {
+            let p = cmd.watchdog_phase.load(Ordering::Acquire);
+            let n: Arc<str> = cmd
+                .watchdog_node
+                .get()
+                .map(|s| Arc::from(s.as_str()))
+                .unwrap_or_else(|| UNKNOWN_NODE.clone());
+            let r = cmd.watchdog_retry_count.load(Ordering::Relaxed);
+            (p, n, r)
+        } else {
+            (PHASE_QUEUED, UNKNOWN_NODE.clone(), 0)
+        };
+
         let phase = if phase_val == PHASE_SENT {
             CommandPhase::Sent
         } else {
             CommandPhase::Queued
         };
-
-        let node: Arc<str> = entry
-            .handle
-            .node
-            .get()
-            .map(|s| Arc::from(s.as_str()))
-            .unwrap_or_else(|| UNKNOWN_NODE.clone());
 
         let cause = if phase == CommandPhase::Queued {
             TimeoutCause::ClientBackpressure {
@@ -838,7 +793,7 @@ impl TimeoutWatchdog {
         };
 
         // p99() is a cheap sort over the ring buffer — no syscall, no scan.
-        let recent_p99 = entry.handle.latency_tracker.as_ref().and_then(|t| t.p99());
+        let recent_p99 = entry.latency_tracker.as_ref().and_then(|t| t.p99());
         let suggested_timeout = recent_p99.map(|p99| (p99 * 3).max(configured_timeout));
 
         TimeoutEvent {
@@ -854,10 +809,11 @@ impl TimeoutWatchdog {
             rss_bytes: None,
             suggested_timeout,
             inflight_at_register: entry.inflight_at_register,
-            inflight_at_timeout: entry.handle.inflight_counter.as_ref().map(|counter| {
-                (entry.handle.inflight_limit - counter.load(Ordering::Relaxed)) as usize
-            }),
-            retry_count: entry.handle.retry_count.load(Ordering::Relaxed),
+            inflight_at_timeout: entry
+                .inflight_counter
+                .as_ref()
+                .map(|counter| (entry.inflight_limit - counter.load(Ordering::Relaxed)) as usize),
+            retry_count,
         }
     }
 
@@ -871,20 +827,25 @@ impl TimeoutWatchdog {
         let actual_elapsed = now.duration_since(entry.submitted_at);
         let configured_timeout = entry.deadline.duration_since(entry.submitted_at);
 
-        let phase_val = entry.handle.phase.load(Ordering::Acquire);
+        // Try to read diagnostic state from the Cmd.
+        let (phase_val, node, retry_count) = if let Some(cmd) = entry.cmd.upgrade() {
+            let p = cmd.watchdog_phase.load(Ordering::Acquire);
+            let n: Arc<str> = cmd
+                .watchdog_node
+                .get()
+                .map(|s| Arc::from(s.as_str()))
+                .unwrap_or_else(|| UNKNOWN_NODE.clone());
+            let r = cmd.watchdog_retry_count.load(Ordering::Relaxed);
+            (p, n, r)
+        } else {
+            (PHASE_QUEUED, UNKNOWN_NODE.clone(), 0)
+        };
+
         let phase = if phase_val == PHASE_SENT {
             CommandPhase::Sent
         } else {
             CommandPhase::Queued
         };
-
-        // Resolve node: convert the stored String to Arc<str> only at fire time.
-        let node: Arc<str> = entry
-            .handle
-            .node
-            .get()
-            .map(|s| Arc::from(s.as_str()))
-            .unwrap_or_else(|| UNKNOWN_NODE.clone());
 
         // Count pending commands (total and same-node)
         // Bounded scan to avoid O(n) stall during timeout storms
@@ -900,7 +861,8 @@ impl TimeoutWatchdog {
                 scanned += 1;
                 if !e.sender.is_closed() {
                     pending_total += 1;
-                    if let Some(e_node) = e.handle.node.get()
+                    if let Some(e_cmd) = e.cmd.upgrade()
+                        && let Some(e_node) = e_cmd.watchdog_node.get()
                         && e_node.as_str() == node.as_ref()
                     {
                         same_node_pending += 1;
@@ -909,7 +871,7 @@ impl TimeoutWatchdog {
             }
         }
 
-        let recent_p99 = entry.handle.latency_tracker.as_ref().and_then(|t| t.p99());
+        let recent_p99 = entry.latency_tracker.as_ref().and_then(|t| t.p99());
         let rss_bytes = get_rss();
 
         // Classify the cause
@@ -939,10 +901,11 @@ impl TimeoutWatchdog {
             rss_bytes,
             suggested_timeout,
             inflight_at_register: entry.inflight_at_register,
-            inflight_at_timeout: entry.handle.inflight_counter.as_ref().map(|counter| {
-                (entry.handle.inflight_limit - counter.load(Ordering::Relaxed)) as usize
-            }),
-            retry_count: entry.handle.retry_count.load(Ordering::Relaxed),
+            inflight_at_timeout: entry
+                .inflight_counter
+                .as_ref()
+                .map(|counter| (entry.inflight_limit - counter.load(Ordering::Relaxed)) as usize),
+            retry_count,
         }
     }
 
@@ -990,13 +953,27 @@ impl TimeoutWatchdog {
 mod tests {
     use super::*;
 
+    /// Helper: create an Arc<Cmd> for use in tests.
+    fn make_cmd() -> Arc<redis::Cmd> {
+        Arc::new(redis::cmd("GET"))
+    }
+
     // ── Basic Firing Behavior ────────────────────────────────────────────
 
     #[tokio::test]
     async fn fires_with_diagnostic_event() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
-        handle.mark_sent("127.0.0.1:6379");
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(50),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let event = rx.await.unwrap();
         assert_eq!(event.command, "GET");
@@ -1010,8 +987,16 @@ mod tests {
     #[tokio::test]
     async fn does_not_fire_before_deadline() {
         let watchdog = TimeoutWatchdog::start();
-        let (mut rx, _handle) =
-            watchdog.register(Duration::from_millis(200), "GET", None, None, None, 0);
+        let cmd = make_cmd();
+        let mut rx = watchdog.register(
+            Duration::from_millis(200),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
     }
@@ -1019,12 +1004,28 @@ mod tests {
     #[tokio::test]
     async fn multiple_deadlines_fire_in_order() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx1, handle1) =
-            watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
-        let (rx2, handle2) =
-            watchdog.register(Duration::from_millis(60), "SET", None, None, None, 0);
-        handle1.mark_sent("127.0.0.1:6379");
-        handle2.mark_sent("127.0.0.1:6379");
+        let cmd1 = make_cmd();
+        let cmd2 = Arc::new(redis::cmd("SET"));
+        cmd1.mark_sent("127.0.0.1:6379");
+        cmd2.mark_sent("127.0.0.1:6379");
+        let rx1 = watchdog.register(
+            Duration::from_millis(30),
+            "GET",
+            Arc::downgrade(&cmd1),
+            None,
+            None,
+            None,
+            0,
+        );
+        let rx2 = watchdog.register(
+            Duration::from_millis(60),
+            "SET",
+            Arc::downgrade(&cmd2),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let event1 = rx1.await.unwrap();
         let mid = Instant::now();
@@ -1039,12 +1040,18 @@ mod tests {
     #[tokio::test]
     async fn cancelled_before_deadline_does_not_fire() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) =
-            watchdog.register(Duration::from_millis(200), "GET", None, None, None, 0);
-        // Drop the receiver — simulates command completing before timeout
+        let cmd = make_cmd();
+        let rx = watchdog.register(
+            Duration::from_millis(200),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
         drop(rx);
         tokio::time::sleep(Duration::from_millis(250)).await;
-        // No panic, no event — watchdog handles closed senders gracefully
     }
 
     // ── Phase Tracking ───────────────────────────────────────────────────
@@ -1052,9 +1059,16 @@ mod tests {
     #[tokio::test]
     async fn phase_defaults_to_queued() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) =
-            watchdog.register(Duration::from_millis(30), "SET", None, None, None, 0);
-        // Don't call mark_sent
+        let cmd = make_cmd();
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            "SET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let event = rx.await.unwrap();
         assert_eq!(event.phase, CommandPhase::Queued);
@@ -1063,8 +1077,17 @@ mod tests {
     #[tokio::test]
     async fn phase_transitions_to_sent() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "SET", None, None, None, 0);
-        handle.mark_sent("127.0.0.1:6379");
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            "SET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let event = rx.await.unwrap();
         assert_eq!(event.phase, CommandPhase::Sent);
@@ -1072,13 +1095,20 @@ mod tests {
 
     #[tokio::test]
     async fn late_phase_transition_captured() {
-        // Phase transitions after registration but before fire should be captured
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(80), "SET", None, None, None, 0);
+        let cmd = make_cmd();
+        let rx = watchdog.register(
+            Duration::from_millis(80),
+            "SET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
-        // Transition after 30ms (before the 80ms deadline)
         tokio::time::sleep(Duration::from_millis(30)).await;
-        handle.mark_sent("127.0.0.1:6379");
+        cmd.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         assert_eq!(event.phase, CommandPhase::Sent);
@@ -1089,8 +1119,16 @@ mod tests {
     #[tokio::test]
     async fn classifies_client_backpressure_when_queued() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) =
-            watchdog.register(Duration::from_millis(30), "SET", None, None, None, 0);
+        let cmd = make_cmd();
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            "SET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let event = rx.await.unwrap();
         assert!(matches!(
@@ -1102,8 +1140,17 @@ mod tests {
     #[tokio::test]
     async fn classifies_server_unresponsive_single_command() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
-        handle.mark_sent("127.0.0.1:6379");
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let event = rx.await.unwrap();
         assert!(matches!(
@@ -1115,12 +1162,21 @@ mod tests {
     #[tokio::test]
     async fn classifies_node_degraded_many_same_node() {
         let watchdog = TimeoutWatchdog::start();
-
         let mut receivers = Vec::new();
+        let mut cmds = Vec::new();
         for _ in 0..10 {
-            let (rx, handle) =
-                watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
-            handle.mark_sent("10.0.0.1:6379");
+            let cmd = make_cmd();
+            cmd.mark_sent("10.0.0.1:6379");
+            let rx = watchdog.register(
+                Duration::from_millis(50),
+                "GET",
+                Arc::downgrade(&cmd),
+                None,
+                None,
+                None,
+                0,
+            );
+            cmds.push(cmd);
             receivers.push(rx);
         }
 
@@ -1134,13 +1190,21 @@ mod tests {
     #[tokio::test]
     async fn classifies_system_overload_many_nodes() {
         let watchdog = TimeoutWatchdog::start();
-
-        // Register >100 commands across different nodes
         let mut receivers = Vec::new();
+        let mut cmds = Vec::new();
         for i in 0..110 {
-            let (rx, handle) =
-                watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
-            handle.mark_sent(&format!("10.0.0.{}:6379", i % 50));
+            let cmd = make_cmd();
+            cmd.mark_sent(&format!("10.0.0.{}:6379", i % 50));
+            let rx = watchdog.register(
+                Duration::from_millis(50),
+                "GET",
+                Arc::downgrade(&cmd),
+                None,
+                None,
+                None,
+                0,
+            );
+            cmds.push(cmd);
             receivers.push(rx);
         }
 
@@ -1153,25 +1217,51 @@ mod tests {
     #[tokio::test]
     async fn reports_pending_command_counts() {
         let watchdog = TimeoutWatchdog::start();
-
-        // 3 commands to node_a, 2 to node_b, all with same deadline
-        let (rx_target, handle) =
-            watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
-        handle.mark_sent("10.0.0.1:6379");
+        let cmd_target = make_cmd();
+        cmd_target.mark_sent("10.0.0.1:6379");
+        let rx_target = watchdog.register(
+            Duration::from_millis(50),
+            "GET",
+            Arc::downgrade(&cmd_target),
+            None,
+            None,
+            None,
+            0,
+        );
         let mut _holders = Vec::new();
+        let mut _cmd_holders = Vec::new();
         for _ in 0..2 {
-            let (rx, h) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
-            h.mark_sent("10.0.0.1:6379");
+            let cmd = make_cmd();
+            cmd.mark_sent("10.0.0.1:6379");
+            let rx = watchdog.register(
+                Duration::from_millis(50),
+                "GET",
+                Arc::downgrade(&cmd),
+                None,
+                None,
+                None,
+                0,
+            );
+            _cmd_holders.push(cmd);
             _holders.push(rx);
         }
         for _ in 0..2 {
-            let (rx, h) = watchdog.register(Duration::from_millis(50), "SET", None, None, None, 0);
-            h.mark_sent("10.0.0.2:6379");
+            let cmd = Arc::new(redis::cmd("SET"));
+            cmd.mark_sent("10.0.0.2:6379");
+            let rx = watchdog.register(
+                Duration::from_millis(50),
+                "SET",
+                Arc::downgrade(&cmd),
+                None,
+                None,
+                None,
+                0,
+            );
+            _cmd_holders.push(cmd);
             _holders.push(rx);
         }
 
         let event = rx_target.await.unwrap();
-        // At fire time, the other 4 are still pending (this one already fired)
         assert!(event.pending_commands >= 4);
         assert!(event.same_node_pending >= 2);
     }
@@ -1201,12 +1291,10 @@ mod tests {
     #[tokio::test]
     async fn latency_tracker_wraps_around() {
         let tracker = Arc::new(LatencyTracker::new(10));
-        // Write 20 samples into a 10-slot buffer
         for i in 1..=20 {
             tracker.record(Duration::from_millis(i));
         }
         let p99 = tracker.p99().unwrap();
-        // Buffer should contain samples 11..=20 (the last 10)
         assert!(p99 >= Duration::from_millis(19));
         assert!(p99 <= Duration::from_millis(20));
     }
@@ -1215,21 +1303,21 @@ mod tests {
     async fn timeout_event_includes_p99_from_tracker() {
         let watchdog = TimeoutWatchdog::start();
         let tracker = Arc::new(LatencyTracker::new(100));
-
-        // Populate tracker with latency data
         for i in 1..=100 {
             tracker.record(Duration::from_millis(i));
         }
 
-        let (rx, handle) = watchdog.register(
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
             Duration::from_millis(30),
             "GET",
+            Arc::downgrade(&cmd),
             Some(tracker),
             None,
             None,
             0,
         );
-        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         assert!(event.recent_p99_latency.is_some());
@@ -1243,25 +1331,24 @@ mod tests {
     async fn suggested_timeout_is_3x_p99() {
         let watchdog = TimeoutWatchdog::start();
         let tracker = Arc::new(LatencyTracker::new(100));
-
-        // All latencies are 10ms → p99 ≈ 10ms → suggested ≈ 30ms
         for _ in 0..100 {
             tracker.record(Duration::from_millis(10));
         }
 
-        let (rx, handle) = watchdog.register(
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
             Duration::from_millis(20),
             "GET",
+            Arc::downgrade(&cmd),
             Some(tracker),
             None,
             None,
             0,
         );
-        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         let suggested = event.suggested_timeout.unwrap();
-        // 3x p99 = 30ms, but configured is 20ms, so max(30, 20) = 30ms
         assert!(suggested >= Duration::from_millis(28));
         assert!(suggested <= Duration::from_millis(35));
     }
@@ -1270,33 +1357,41 @@ mod tests {
     async fn suggested_timeout_at_least_configured() {
         let watchdog = TimeoutWatchdog::start();
         let tracker = Arc::new(LatencyTracker::new(100));
-
-        // All latencies are 1ms → p99 ≈ 1ms → 3x = 3ms, but configured is 30ms
         for _ in 0..100 {
             tracker.record(Duration::from_millis(1));
         }
 
-        let (rx, handle) = watchdog.register(
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
             Duration::from_millis(30),
             "GET",
+            Arc::downgrade(&cmd),
             Some(tracker),
             None,
             None,
             0,
         );
-        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         let suggested = event.suggested_timeout.unwrap();
-        // max(3ms, 30ms) = 30ms
         assert!(suggested >= Duration::from_millis(30));
     }
 
     #[tokio::test]
     async fn no_suggested_timeout_without_tracker() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
-        handle.mark_sent("127.0.0.1:6379");
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let event = rx.await.unwrap();
         assert!(event.suggested_timeout.is_none());
@@ -1307,8 +1402,17 @@ mod tests {
     #[tokio::test]
     async fn rss_is_populated_on_supported_platforms() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
-        handle.mark_sent("127.0.0.1:6379");
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let event = rx.await.unwrap();
         if cfg!(any(target_os = "linux", target_os = "macos")) {
@@ -1326,8 +1430,19 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         let start = Instant::now();
         let mut receivers = Vec::with_capacity(10_000);
+        let mut cmds = Vec::with_capacity(10_000);
         for _ in 0..10_000 {
-            let (rx, _) = watchdog.register(Duration::from_secs(60), "GET", None, None, None, 0);
+            let cmd = make_cmd();
+            let rx = watchdog.register(
+                Duration::from_secs(60),
+                "GET",
+                Arc::downgrade(&cmd),
+                None,
+                None,
+                None,
+                0,
+            );
+            cmds.push(cmd);
             receivers.push(rx);
         }
         let elapsed = start.elapsed();
@@ -1337,23 +1452,38 @@ mod tests {
             elapsed
         );
         drop(receivers);
+        drop(cmds);
     }
 
     #[tokio::test]
     async fn completed_commands_dont_accumulate() {
         let watchdog = TimeoutWatchdog::start();
-
-        // Register 1000 timeouts and immediately drop receivers
         for _ in 0..1000 {
-            let (_rx, _) = watchdog.register(Duration::from_secs(1), "GET", None, None, None, 0);
+            let cmd = make_cmd();
+            let _rx = watchdog.register(
+                Duration::from_secs(1),
+                "GET",
+                Arc::downgrade(&cmd),
+                None,
+                None,
+                None,
+                0,
+            );
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Watchdog should still function after cleanup
-        let (rx, handle) =
-            watchdog.register(Duration::from_millis(30), "PING", None, None, None, 0);
-        handle.mark_sent("127.0.0.1:6379");
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            "PING",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
         let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
         assert!(
             result.is_ok(),
@@ -1364,19 +1494,27 @@ mod tests {
     #[tokio::test]
     async fn concurrent_register_from_multiple_tasks() {
         let watchdog = TimeoutWatchdog::start();
-
         let mut handles = Vec::new();
         for _ in 0..10 {
             let w = watchdog.clone();
             handles.push(tokio::spawn(async move {
                 let mut rxs = Vec::new();
+                let mut cmds = Vec::new();
                 for _ in 0..100 {
-                    let (rx, handle) =
-                        w.register(Duration::from_millis(50), "GET", None, None, None, 0);
-                    handle.mark_sent("127.0.0.1:6379");
+                    let cmd = Arc::new(redis::cmd("GET"));
+                    cmd.mark_sent("127.0.0.1:6379");
+                    let rx = w.register(
+                        Duration::from_millis(50),
+                        "GET",
+                        Arc::downgrade(&cmd),
+                        None,
+                        None,
+                        None,
+                        0,
+                    );
+                    cmds.push(cmd);
                     rxs.push(rx);
                 }
-                // All should fire
                 for rx in rxs {
                     rx.await.unwrap();
                 }
@@ -1392,8 +1530,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn watchdog_fires_under_tokio_starvation() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) =
-            watchdog.register(Duration::from_millis(100), "PING", None, None, None, 0);
+        let cmd = make_cmd();
+        let rx = watchdog.register(
+            Duration::from_millis(100),
+            "PING",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let blocker = tokio::spawn(async {
             let start = Instant::now();
@@ -1414,9 +1560,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn starvation_produces_diagnostic_event() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) = watchdog.register(
+        let cmd = make_cmd();
+        let rx = watchdog.register(
             Duration::from_millis(80),
             "CLUSTER SLOTS",
+            Arc::downgrade(&cmd),
             None,
             None,
             None,
@@ -1434,7 +1582,6 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(1), rx).await;
         assert!(result.is_ok());
         let event = result.unwrap().unwrap();
-        // Command was never sent (Tokio couldn't schedule it)
         assert_eq!(event.phase, CommandPhase::Queued);
         assert!(matches!(
             event.cause,
@@ -1449,8 +1596,17 @@ mod tests {
     #[tokio::test]
     async fn timeout_event_is_debug_printable() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
-        handle.mark_sent("127.0.0.1:6379");
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let event = rx.await.unwrap();
         let debug_str = format!("{:?}", event);
@@ -1462,14 +1618,20 @@ mod tests {
     // ── Wiring Verification ──────────────────────────────────────────────
 
     #[tokio::test]
-    async fn diagnostic_handle_on_cmd_sets_node_and_phase() {
-        // Simulates the full flow: register → attach to Cmd → on_sent → fire
+    async fn inline_cmd_fields_set_node_and_phase() {
         let watchdog = TimeoutWatchdog::start();
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "SET", None, None, None, 0);
+        let cmd = Arc::new(redis::cmd("SET"));
+        let rx = watchdog.register(
+            Duration::from_millis(50),
+            "SET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
-        // Simulate what try_cmd_request does: call on_sent via DiagnosticHandle trait
-        use redis::DiagnosticHandle;
-        handle.on_sent("10.0.0.5:6379");
+        cmd.mark_sent("10.0.0.5:6379");
 
         let event = rx.await.unwrap();
         assert_eq!(event.command, "SET");
@@ -1478,22 +1640,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diagnostic_handle_attaches_to_cmd() {
-        // Verify the handle can be stored on and retrieved from a Cmd
-        let watchdog = TimeoutWatchdog::start();
-        let (_rx, handle) = watchdog.register(Duration::from_secs(60), "GET", None, None, None, 0);
+    async fn mark_sent_updates_cmd_inline_fields() {
+        let cmd = Arc::new(redis::cmd("GET"));
+        cmd.mark_sent("192.168.1.1:6379");
 
-        let mut cmd = redis::cmd("GET");
-        cmd.arg("mykey");
-        cmd.set_diagnostic_handle(handle.clone());
-
-        // Retrieve and call on_sent (simulates try_cmd_request)
-        let retrieved = cmd.diagnostic_handle().unwrap();
-        retrieved.on_sent("192.168.1.1:6379");
-
-        // Verify the original handle was updated
-        assert_eq!(handle.node.get().unwrap().as_str(), "192.168.1.1:6379");
-        assert_eq!(handle.phase.load(Ordering::Acquire), PHASE_SENT);
+        assert_eq!(
+            cmd.watchdog_node.get().unwrap().as_str(),
+            "192.168.1.1:6379"
+        );
+        assert_eq!(cmd.watchdog_phase.load(Ordering::Acquire), PHASE_SENT);
     }
 
     #[tokio::test]
@@ -1508,7 +1663,6 @@ mod tests {
         assert_eq!(cmd_name_from_bytes(b"EXPIRE"), "EXPIRE");
         assert_eq!(cmd_name_from_bytes(b"CLUSTER"), "CLUSTER");
         assert_eq!(cmd_name_from_bytes(b"SUBSCRIBE"), "SUBSCRIBE");
-        // Previously broken: wrong length arms
         assert_eq!(cmd_name_from_bytes(b"PTTL"), "PTTL");
         assert_eq!(cmd_name_from_bytes(b"HMGET"), "HMGET");
         assert_eq!(cmd_name_from_bytes(b"HMSET"), "HMSET");
@@ -1521,12 +1675,17 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_without_mark_sent_reports_queued_and_unknown_node() {
-        // If routing never completes (e.g., connection failure), phase stays Queued
-        // and node is "unknown"
         let watchdog = TimeoutWatchdog::start();
-        let (rx, _handle) =
-            watchdog.register(Duration::from_millis(30), "GET", None, None, None, 0);
-        // Don't call mark_sent — simulates routing failure
+        let cmd = make_cmd();
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
 
         let event = rx.await.unwrap();
         assert_eq!(event.phase, CommandPhase::Queued);
@@ -1540,20 +1699,21 @@ mod tests {
     #[tokio::test]
     async fn inflight_count_propagated_to_event() {
         let watchdog = TimeoutWatchdog::start();
-        let inflight_allowed = Arc::new(AtomicIsize::new(958)); // 1000 - 42 = 958 remaining
-        let (rx, handle) = watchdog.register(
+        let inflight_allowed = Arc::new(AtomicIsize::new(958));
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
             Duration::from_millis(30),
             "GET",
+            Arc::downgrade(&cmd),
             None,
             Some(42),
             Some(inflight_allowed.clone()),
             1000,
         );
-        handle.mark_sent("127.0.0.1:6379");
 
         let event = rx.await.unwrap();
         assert_eq!(event.inflight_at_register, Some(42));
-        // At fire time: 1000 - 958 = 42 (unchanged)
         assert_eq!(event.inflight_at_timeout, Some(42));
     }
 }

@@ -10,6 +10,11 @@ use glide_core::timeout_watchdog::{CommandPhase, LatencyTracker, TimeoutCause, T
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Helper: create an Arc<redis::Cmd> for use in tests.
+fn make_cmd() -> Arc<redis::Cmd> {
+    Arc::new(redis::cmd("GET"))
+}
+
 // ─── Global Singleton Tests ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -23,8 +28,17 @@ async fn global_watchdog_is_singleton() {
 #[tokio::test]
 async fn global_watchdog_fires_timeout() {
     let watchdog = TimeoutWatchdog::global();
-    let (rx, handle) = watchdog.register(Duration::from_millis(40), "PING", None, None, None, 0);
-    handle.mark_sent("127.0.0.1:6379");
+    let cmd = make_cmd();
+    cmd.mark_sent("127.0.0.1:6379");
+    let rx = watchdog.register(
+        Duration::from_millis(40),
+        "PING",
+        Arc::downgrade(&cmd),
+        None,
+        None,
+        None,
+        0,
+    );
 
     let event = rx.await.unwrap();
     assert_eq!(event.command, "PING");
@@ -40,15 +54,17 @@ async fn command_completes_before_timeout() {
     let watchdog = TimeoutWatchdog::start();
     let tracker = Arc::new(LatencyTracker::new(100));
 
-    let (rx, handle) = watchdog.register(
+    let cmd = make_cmd();
+    cmd.mark_sent("127.0.0.1:6379");
+    let rx = watchdog.register(
         Duration::from_millis(200),
         "GET",
+        Arc::downgrade(&cmd),
         Some(tracker.clone()),
         None,
         None,
         0,
     );
-    handle.mark_sent("127.0.0.1:6379");
 
     // Simulate command completing after 50ms
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -72,16 +88,19 @@ async fn mixed_completion_and_timeout() {
 
     // Register 5 commands: first 3 will "complete", last 2 will timeout
     let mut timeout_receivers = Vec::new();
+    let mut _cmd_holders = Vec::new();
     for i in 0..5 {
-        let (rx, handle) = watchdog.register(
+        let cmd = make_cmd();
+        cmd.mark_sent("127.0.0.1:6379");
+        let rx = watchdog.register(
             Duration::from_millis(100),
             "GET",
+            Arc::downgrade(&cmd),
             Some(tracker.clone()),
             None,
             None,
             0,
         );
-        handle.mark_sent("127.0.0.1:6379");
         if i < 3 {
             // Simulate completion
             tracker.record(Duration::from_millis(10));
@@ -89,6 +108,7 @@ async fn mixed_completion_and_timeout() {
         } else {
             timeout_receivers.push(rx);
         }
+        _cmd_holders.push(cmd);
     }
 
     // The 2 remaining should timeout with diagnostics
@@ -109,16 +129,36 @@ async fn multi_node_timeout_classification() {
     let watchdog = TimeoutWatchdog::start();
 
     // 3 commands to node A, 3 to node B — evenly distributed
-
     let mut receivers = Vec::new();
+    let mut cmds = Vec::new();
     for _ in 0..3 {
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
-        handle.mark_sent("10.0.0.1:6379");
+        let cmd = make_cmd();
+        cmd.mark_sent("10.0.0.1:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(50),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
+        cmds.push(cmd);
         receivers.push(rx);
     }
     for _ in 0..3 {
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "SET", None, None, None, 0);
-        handle.mark_sent("10.0.0.2:6379");
+        let cmd = Arc::new(redis::cmd("SET"));
+        cmd.mark_sent("10.0.0.2:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(50),
+            "SET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
+        cmds.push(cmd);
         receivers.push(rx);
     }
 
@@ -135,14 +175,35 @@ async fn single_node_dominates_pending() {
 
     // 8 commands to bad_node, 2 to good_node
     let mut receivers = Vec::new();
+    let mut cmds = Vec::new();
     for _ in 0..8 {
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
-        handle.mark_sent("10.0.0.99:6379");
+        let cmd = make_cmd();
+        cmd.mark_sent("10.0.0.99:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(50),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
+        cmds.push(cmd);
         receivers.push(rx);
     }
     for _ in 0..2 {
-        let (rx, handle) = watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
-        handle.mark_sent("10.0.0.1:6379");
+        let cmd = make_cmd();
+        cmd.mark_sent("10.0.0.1:6379");
+        let rx = watchdog.register(
+            Duration::from_millis(50),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
+        cmds.push(cmd);
         receivers.push(rx);
     }
 
@@ -167,15 +228,17 @@ async fn shared_tracker_across_commands() {
     }
 
     // Now a command times out — should see the accumulated p99
-    let (rx, handle) = watchdog.register(
+    let cmd = make_cmd();
+    cmd.mark_sent("127.0.0.1:6379");
+    let rx = watchdog.register(
         Duration::from_millis(30),
         "HGETALL",
+        Arc::downgrade(&cmd),
         Some(tracker.clone()),
         None,
         None,
         0,
     );
-    handle.mark_sent("127.0.0.1:6379");
 
     let event = rx.await.unwrap();
     let p99 = event.recent_p99_latency.unwrap();
@@ -217,8 +280,17 @@ async fn concurrent_latency_recording() {
 async fn actual_elapsed_accuracy() {
     let watchdog = TimeoutWatchdog::start();
     let start = Instant::now();
-    let (rx, handle) = watchdog.register(Duration::from_millis(75), "GET", None, None, None, 0);
-    handle.mark_sent("127.0.0.1:6379");
+    let cmd = make_cmd();
+    cmd.mark_sent("127.0.0.1:6379");
+    let rx = watchdog.register(
+        Duration::from_millis(75),
+        "GET",
+        Arc::downgrade(&cmd),
+        None,
+        None,
+        None,
+        0,
+    );
 
     let event = rx.await.unwrap();
     let wall_elapsed = start.elapsed();
@@ -237,8 +309,9 @@ async fn actual_elapsed_accuracy() {
 async fn configured_timeout_matches_registration() {
     let watchdog = TimeoutWatchdog::start();
     let timeout = Duration::from_millis(42);
-    let (rx, handle) = watchdog.register(timeout, "SET", None, None, None, 0);
-    handle.mark_sent("127.0.0.1:6379");
+    let cmd = make_cmd();
+    cmd.mark_sent("127.0.0.1:6379");
+    let rx = watchdog.register(timeout, "SET", Arc::downgrade(&cmd), None, None, None, 0);
 
     let event = rx.await.unwrap();
     assert_eq!(event.configured_timeout, timeout);
@@ -253,13 +326,31 @@ async fn watchdog_survives_rapid_register_cancel_cycles() {
 
     // Rapid register + cancel (simulates fast commands)
     for _ in 0..5000 {
-        let (rx, _) = watchdog.register(Duration::from_secs(10), "GET", None, None, None, 0);
+        let cmd = make_cmd();
+        let rx = watchdog.register(
+            Duration::from_secs(10),
+            "GET",
+            Arc::downgrade(&cmd),
+            None,
+            None,
+            None,
+            0,
+        );
         drop(rx);
     }
 
     // Now register one that should actually fire
-    let (rx, handle) = watchdog.register(Duration::from_millis(30), "PING", None, None, None, 0);
-    handle.mark_sent("127.0.0.1:6379");
+    let cmd = make_cmd();
+    cmd.mark_sent("127.0.0.1:6379");
+    let rx = watchdog.register(
+        Duration::from_millis(30),
+        "PING",
+        Arc::downgrade(&cmd),
+        None,
+        None,
+        None,
+        0,
+    );
 
     let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
     assert!(result.is_ok());
@@ -271,8 +362,17 @@ async fn watchdog_survives_rapid_register_cancel_cycles() {
 #[tokio::test]
 async fn zero_duration_timeout_fires_immediately() {
     let watchdog = TimeoutWatchdog::start();
-    let (rx, handle) = watchdog.register(Duration::from_millis(0), "GET", None, None, None, 0);
-    handle.mark_sent("127.0.0.1:6379");
+    let cmd = make_cmd();
+    cmd.mark_sent("127.0.0.1:6379");
+    let rx = watchdog.register(
+        Duration::from_millis(0),
+        "GET",
+        Arc::downgrade(&cmd),
+        None,
+        None,
+        None,
+        0,
+    );
 
     let result = tokio::time::timeout(Duration::from_millis(100), rx).await;
     assert!(
@@ -287,13 +387,30 @@ async fn long_timeout_doesnt_block_short() {
     let watchdog = TimeoutWatchdog::start();
 
     // Register a 10-second timeout first
-    let (_long_rx, _) = watchdog.register(Duration::from_secs(10), "SLOWLOG", None, None, None, 0);
+    let long_cmd = make_cmd();
+    let _long_rx = watchdog.register(
+        Duration::from_secs(10),
+        "SLOWLOG",
+        Arc::downgrade(&long_cmd),
+        None,
+        None,
+        None,
+        0,
+    );
 
     // Then a 50ms timeout — should fire on time
     let start = Instant::now();
-    let (short_rx, handle) =
-        watchdog.register(Duration::from_millis(50), "GET", None, None, None, 0);
-    handle.mark_sent("127.0.0.1:6379");
+    let cmd = make_cmd();
+    cmd.mark_sent("127.0.0.1:6379");
+    let short_rx = watchdog.register(
+        Duration::from_millis(50),
+        "GET",
+        Arc::downgrade(&cmd),
+        None,
+        None,
+        None,
+        0,
+    );
 
     let event = short_rx.await.unwrap();
     let elapsed = start.elapsed();
@@ -308,8 +425,7 @@ async fn long_timeout_doesnt_block_short() {
 // ─── End-to-End Watchdog Wiring Test ─────────────────────────────────────────
 
 /// Verifies the full diagnostic pipeline by simulating what send_command does:
-/// register → attach handle to Cmd → on_sent (simulating try_cmd_request) →
-/// timeout fires → event has correct fields.
+/// register → mark_sent on Cmd → timeout fires → event has correct fields.
 #[tokio::test]
 async fn end_to_end_send_command_simulation() {
     let watchdog = TimeoutWatchdog::start();
@@ -320,10 +436,12 @@ async fn end_to_end_send_command_simulation() {
         tracker.record(Duration::from_millis(5));
     }
 
-    // Simulate send_command: register with watchdog
-    let (timeout_rx, handle) = watchdog.register(
+    // Simulate send_command: create Arc<Cmd>, register with watchdog
+    let cmd = make_cmd();
+    let timeout_rx = watchdog.register(
         Duration::from_millis(50),
         "GET",
+        Arc::downgrade(&cmd),
         Some(tracker.clone()),
         Some(42),
         None,
@@ -331,11 +449,10 @@ async fn end_to_end_send_command_simulation() {
     );
 
     // Simulate try_cmd_request: routing resolves, mark as sent
-    handle.mark_sent("10.0.0.5:6379");
+    cmd.mark_sent("10.0.0.5:6379");
 
     // Simulate a retry
-    use redis::DiagnosticHandle;
-    handle.on_retry();
+    cmd.mark_retry();
 
     // Wait for timeout to fire
     let event = timeout_rx.await.unwrap();

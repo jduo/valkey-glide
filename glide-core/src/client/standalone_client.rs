@@ -761,9 +761,7 @@ impl StandaloneClient {
         reconnecting_connection: &ReconnectingConnection,
     ) -> RedisResult<Value> {
         // Mark command as sent for watchdog diagnostics
-        if let Some(handle) = cmd.diagnostic_handle() {
-            handle.on_sent_owned(reconnecting_connection.node_address());
-        }
+        cmd.mark_sent_owned(reconnecting_connection.node_address());
         let mut connection = reconnecting_connection.get_connection().await?;
         let result = connection.send_packed_command(cmd).await;
         match result {

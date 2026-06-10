@@ -6,6 +6,7 @@ use futures_util::{
 };
 #[cfg(feature = "aio")]
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{borrow::Borrow, fmt, io};
 
 use crate::pipeline::Pipeline;
@@ -22,8 +23,12 @@ pub enum Arg<D> {
     Cursor,
 }
 
+/// Atomic phase value: command is queued but not yet sent.
+pub const PHASE_QUEUED: u8 = 0;
+/// Atomic phase value: command has been sent to a node.
+pub const PHASE_SENT: u8 = 1;
+
 /// Represents redis commands.
-#[derive(Clone)]
 pub struct Cmd {
     data: Vec<u8>,
     // Arg::Simple contains the offset that marks the end of the argument
@@ -44,24 +49,36 @@ pub struct Cmd {
     /// timeout from internal pipeline cleanup.
     #[cfg(feature = "cluster-async")]
     inflight_tracker: Option<crate::cluster_async::InflightRequestTracker>,
-    /// Opaque diagnostic handle for timeout watchdog. The routing layer calls
-    /// into this after resolving the target node address.
-    diagnostic_handle: Option<std::sync::Arc<dyn DiagnosticHandle>>,
+    /// Inline watchdog phase: 0 = Queued, 1 = Sent. Updated atomically by the
+    /// routing layer after connection resolution.
+    pub watchdog_phase: AtomicU8,
+    /// The resolved node address. Set once by the routing layer.
+    pub watchdog_node: std::sync::OnceLock<String>,
+    /// Number of retries attempted. Incremented by the routing layer.
+    pub watchdog_retry_count: AtomicU8,
 }
 
-/// Trait for diagnostic handles that receive routing information.
-/// Implemented by the timeout watchdog to track command phase transitions.
-pub trait DiagnosticHandle: Send + Sync {
-    /// Called when the command has been routed and sent to a specific node.
-    fn on_sent(&self, node_address: &str);
-    /// Called when the command has been routed and sent, with an owned address.
-    /// Default implementation delegates to `on_sent`. Override to avoid
-    /// re-allocating when the caller already has an owned String.
-    fn on_sent_owned(&self, node_address: String) {
-        self.on_sent(&node_address);
+// Manual Clone implementation: AtomicU8 and OnceLock don't implement Clone,
+// and watchdog state should reset to defaults on clone (each clone represents
+// a new command attempt).
+impl Clone for Cmd {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            args: self.args.clone(),
+            cursor: self.cursor,
+            no_response: self.no_response,
+            span: self.span.clone(),
+            is_fenced: self.is_fenced,
+            response_timeout: self.response_timeout,
+            #[cfg(feature = "cluster-async")]
+            inflight_tracker: self.inflight_tracker.clone(),
+            // Reset watchdog fields — each clone is a fresh command attempt
+            watchdog_phase: AtomicU8::new(PHASE_QUEUED),
+            watchdog_node: std::sync::OnceLock::new(),
+            watchdog_retry_count: AtomicU8::new(0),
+        }
     }
-    /// Called when the command is being retried. Default no-op.
-    fn on_retry(&self) {}
 }
 
 /// The PING command used to fence other commands for ordering guarantees
@@ -385,7 +402,9 @@ impl Cmd {
             response_timeout: None,
             #[cfg(feature = "cluster-async")]
             inflight_tracker: None,
-            diagnostic_handle: None,
+            watchdog_phase: AtomicU8::new(PHASE_QUEUED),
+            watchdog_node: std::sync::OnceLock::new(),
+            watchdog_retry_count: AtomicU8::new(0),
         }
     }
 
@@ -401,7 +420,9 @@ impl Cmd {
             response_timeout: None,
             #[cfg(feature = "cluster-async")]
             inflight_tracker: None,
-            diagnostic_handle: None,
+            watchdog_phase: AtomicU8::new(PHASE_QUEUED),
+            watchdog_node: std::sync::OnceLock::new(),
+            watchdog_retry_count: AtomicU8::new(0),
         }
     }
 
@@ -715,16 +736,27 @@ impl Cmd {
         self.inflight_tracker = Some(tracker);
     }
 
-    /// Attach a diagnostic handle for timeout watchdog.
+    /// Mark the command as sent and record the resolved node address.
+    /// Called from the routing layer after connection resolution.
+    /// Accepts a borrowed `&str` and clones it into the OnceLock.
     #[inline]
-    pub fn set_diagnostic_handle(&mut self, handle: std::sync::Arc<dyn DiagnosticHandle>) {
-        self.diagnostic_handle = Some(handle);
+    pub fn mark_sent(&self, node_address: &str) {
+        let _ = self.watchdog_node.set(node_address.to_owned());
+        self.watchdog_phase.store(PHASE_SENT, Ordering::Release);
     }
 
-    /// Get the diagnostic handle.
+    /// Like `mark_sent` but takes an owned String, avoiding a re-allocation
+    /// when the caller already has one (e.g. standalone `node_address()`).
     #[inline]
-    pub fn diagnostic_handle(&self) -> Option<&std::sync::Arc<dyn DiagnosticHandle>> {
-        self.diagnostic_handle.as_ref()
+    pub fn mark_sent_owned(&self, node_address: String) {
+        let _ = self.watchdog_node.set(node_address);
+        self.watchdog_phase.store(PHASE_SENT, Ordering::Release);
+    }
+
+    /// Record a retry attempt on this command.
+    #[inline]
+    pub fn mark_retry(&self) {
+        self.watchdog_retry_count.fetch_add(1, Ordering::Relaxed);
     }
 }
 

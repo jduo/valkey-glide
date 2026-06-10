@@ -1317,9 +1317,7 @@ where
                 request.retry = request.retry.saturating_add(1);
                 // Notify diagnostic handle of retry
                 if let CmdArg::Cmd { cmd, .. } = &request.info.cmd {
-                    if let Some(handle) = cmd.diagnostic_handle() {
-                        handle.on_retry();
-                    }
+                    cmd.mark_retry();
                 }
                 // Record retry attempts metric if telemetry is initialized
                 if let Err(e) = GlideOpenTelemetry::record_retry_attempt() {
@@ -3037,9 +3035,7 @@ where
         let routing = match routing {
             InternalRoutingInfo::MultiNode((multi_node_routing, response_policy)) => {
                 // Mark as sent for fan-out commands (multiple nodes)
-                if let Some(handle) = cmd.diagnostic_handle() {
-                    handle.on_sent("fan-out");
-                }
+                cmd.mark_sent("fan-out");
                 return Self::execute_on_multiple_nodes(
                     &cmd,
                     &multi_node_routing,
@@ -3061,9 +3057,7 @@ where
         }
 
         // Mark command as sent for watchdog diagnostics
-        if let Some(handle) = cmd.diagnostic_handle() {
-            handle.on_sent(&address);
-        }
+        cmd.mark_sent(&address);
 
         conn.req_packed_command(&cmd)
             .await
@@ -3085,9 +3079,7 @@ where
 
         // Mark diagnostic handles on pipeline commands as sent
         for cmd in pipeline.cmd_iter() {
-            if let Some(handle) = cmd.diagnostic_handle() {
-                handle.on_sent(&address);
-            }
+            cmd.mark_sent(&address);
         }
 
         conn.req_packed_commands(&pipeline, offset, count, None)
