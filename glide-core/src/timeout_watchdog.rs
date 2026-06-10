@@ -360,10 +360,7 @@ pub enum TimeoutCause {
         scheduling_delay: Duration,
     },
     /// Broad timeout storm across multiple nodes — likely local resource exhaustion.
-    SystemOverload {
-        pending_total: usize,
-        rss_bytes: Option<u64>,
-    },
+    SystemOverload { pending_total: usize },
 }
 
 /// Structured timeout event returned to the caller when a deadline fires.
@@ -385,8 +382,6 @@ pub struct TimeoutEvent {
     pub pending_commands: usize,
     /// Recent p99 latency for the target node (if available).
     pub recent_p99_latency: Option<Duration>,
-    /// Process RSS at fire time (Linux/macOS only).
-    pub rss_bytes: Option<u64>,
     /// Suggested timeout based on recent latency observations.
     pub suggested_timeout: Option<Duration>,
     /// Number of inflight requests when the command was submitted.

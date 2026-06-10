@@ -73,7 +73,7 @@ When a timeout fires, a structured log line is emitted:
 
 ```
 Timeout: cmd=GET node=10.0.0.1:6379 cause=ServerUnresponsive phase=Sent
-  elapsed=252ms configured=250ms pending=47 same_node=12
+  elapsed=252ms configured=250ms pending=47
   inflight=850→920 BUILDING (backpressure increasing during timeout window)
   p99=15ms suggested_timeout=45ms
 ```
@@ -89,7 +89,6 @@ Timeout: cmd=GET node=10.0.0.1:6379 cause=ServerUnresponsive phase=Sent
 | `elapsed` | Actual wall-clock time since submission |
 | `configured` | The timeout duration that was set |
 | `pending` | Total commands registered with the watchdog at fire time |
-| `same_node` | Commands pending to the same node — high values indicate a node hotspot |
 | `inflight` | Format: `at_register→at_timeout`. Shows how backpressure changed during the timeout window |
 | `p99` | Recent p99 latency for this client (from the last 4096 commands) |
 | `suggested_timeout` | 3× observed p99, floored at the configured timeout |
@@ -100,7 +99,6 @@ Timeout: cmd=GET node=10.0.0.1:6379 cause=ServerUnresponsive phase=Sent
 |-------|---------|----------------|
 | `ServerUnresponsive` | Command was sent but the server didn't respond | Check server health, network, slow queries |
 | `ClientBackpressure` | Command never left the client (phase=Queued) | Tokio runtime is starved or connection pool is exhausted |
-| `NodeDegraded` | Majority of pending timeouts target the same node | Node is unhealthy — consider failover or circuit breaking |
 | `SystemOverload` | >100 commands pending across many nodes | Local resource exhaustion (CPU, memory, FDs) |
 
 ### Inflight Trend

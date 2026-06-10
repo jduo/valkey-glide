@@ -1193,7 +1193,6 @@ impl Client {
                                     } else if pending > 100 {
                                         crate::timeout_watchdog::TimeoutCause::SystemOverload {
                                             pending_total: pending,
-                                            rss_bytes: None,
                                         }
                                     } else {
                                         crate::timeout_watchdog::TimeoutCause::ServerUnresponsive {
@@ -1209,7 +1208,6 @@ impl Client {
                                         actual_elapsed,
                                         pending_commands: pending,
                                         recent_p99_latency: p99,
-                                        rss_bytes: None,
                                         suggested_timeout: p99.map(|p| (p * 3).max(duration)),
                                         inflight_at_register: inflight,
                                         inflight_at_timeout: Some(inflight_now),
