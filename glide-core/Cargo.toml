@@ -110,3 +110,7 @@ harness = false
 [[bench]]
 name = "memory_benchmark"
 harness = false
+
+[[bench]]
+name = "watchdog_register_bench"
+harness = false

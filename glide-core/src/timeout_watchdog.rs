@@ -4,6 +4,9 @@
 //! Design: The hot path (`register()`) sends deadlines through a lock-free MPSC
 //! channel. The watchdog thread owns the deadline queue exclusively — no shared
 //! Mutex on the command path.
+//!
+//! The watchdog is a pure timer — it just signals "timeout fired" with `()`.
+//! All diagnostic event construction moves to the consumer side (`client/mod.rs`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,9 +17,16 @@ use tokio::sync::oneshot;
 
 // ─── Public Types ────────────────────────────────────────────────────────────
 
-// WatchdogHandle has been removed. Diagnostic state (phase, node, retry_count)
-// now lives inline on redis::Cmd. The watchdog holds a Weak<redis::Cmd> and
-// reads from it at fire time.
+/// Global pending count: number of registered deadlines that have not yet
+/// fired or been cancelled.
+static PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the current number of pending (registered but not yet fired/cancelled)
+/// watchdog entries.
+pub fn pending_count() -> usize {
+    PENDING_COUNT.load(Ordering::Relaxed)
+}
+
 /// Resolve a command name from raw bytes to a &'static str without allocation.
 /// Exhaustive coverage of all commands in the RequestType enum.
 /// Falls back to "UNKNOWN" for unrecognized commands.
@@ -349,11 +359,6 @@ pub enum TimeoutCause {
         queue_depth: usize,
         scheduling_delay: Duration,
     },
-    /// Multiple commands to the same node are timing out concurrently.
-    NodeDegraded {
-        node: Arc<str>,
-        concurrent_timeouts: usize,
-    },
     /// Broad timeout storm across multiple nodes — likely local resource exhaustion.
     SystemOverload {
         pending_total: usize,
@@ -378,8 +383,6 @@ pub struct TimeoutEvent {
     pub actual_elapsed: Duration,
     /// Total commands pending across all nodes at fire time.
     pub pending_commands: usize,
-    /// Commands pending to the same node at fire time.
-    pub same_node_pending: usize,
     /// Recent p99 latency for the target node (if available).
     pub recent_p99_latency: Option<Duration>,
     /// Process RSS at fire time (Linux/macOS only).
@@ -407,11 +410,7 @@ impl std::fmt::Display for TimeoutEvent {
             self.actual_elapsed,
             self.configured_timeout,
         )?;
-        write!(
-            f,
-            " pending={} same_node={}",
-            self.pending_commands, self.same_node_pending
-        )?;
+        write!(f, " pending={}", self.pending_commands)?;
         if let (Some(at_reg), Some(at_fire)) = (self.inflight_at_register, self.inflight_at_timeout)
         {
             let trend = if at_fire > at_reg + 10 {
@@ -498,92 +497,19 @@ impl LatencyTracker {
     }
 }
 
-// ─── System Diagnostics ──────────────────────────────────────────────────────
-
-/// Returns the process RSS in bytes. Cached for 5 seconds on both Linux and macOS
-/// to avoid repeated syscalls on the watchdog thread during timeout storms.
-fn get_rss() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::sync::Mutex;
-        use std::time::Instant as StdInstant;
-
-        static CACHED: Mutex<(Option<u64>, Option<StdInstant>)> = Mutex::new((None, None));
-        const CACHE_TTL: Duration = Duration::from_secs(5);
-
-        let mut cache = CACHED.lock().ok()?;
-        if let (Some(val), Some(ts)) = *cache
-            && ts.elapsed() < CACHE_TTL
-        {
-            return Some(val);
-        }
-
-        let rss_bytes = std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("VmRSS:"))
-                    .and_then(|l| {
-                        l.split_whitespace()
-                            .nth(1)
-                            .and_then(|v| v.parse::<u64>().ok())
-                    })
-                    .map(|kb| kb * 1024) // convert to bytes
-            });
-
-        *cache = (rss_bytes, Some(StdInstant::now()));
-        rss_bytes
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use std::sync::Mutex;
-        use std::time::Instant as StdInstant;
-
-        static CACHED: Mutex<(Option<u64>, Option<StdInstant>)> = Mutex::new((None, None));
-        const CACHE_TTL: Duration = Duration::from_secs(5);
-
-        let mut cache = CACHED.lock().ok()?;
-        if let (Some(val), Some(ts)) = *cache
-            && ts.elapsed() < CACHE_TTL
-        {
-            return Some(val);
-        }
-
-        let output = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-            .output()
-            .ok()?;
-        let rss_kb = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u64>()
-            .ok()?;
-        let rss_bytes = rss_kb * 1024;
-        *cache = (Some(rss_bytes), Some(StdInstant::now()));
-        Some(rss_bytes)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
 // ─── Deadline Entry ──────────────────────────────────────────────────────────
 
 /// Internal entry sent from callers to the watchdog thread.
-/// Minimal struct: only what the watchdog needs that can't be read from the Cmd.
-/// Command name is read from Cmd at fire time via cmd_name_from_bytes.
+/// Minimal struct: the watchdog is a pure timer.
 struct DeadlineEntry {
     deadline: Instant,
-    sender: oneshot::Sender<TimeoutEvent>,
-    cmd: std::sync::Weak<redis::Cmd>,
-    submitted_at: Instant,
-    inflight_at_register: Option<usize>,
+    sender: oneshot::Sender<()>,
 }
 
 // ─── Timeout Watchdog ────────────────────────────────────────────────────────
 
-/// Handle to the watchdog thread. Register deadlines and receive diagnostic
-/// timeout events.
+/// Handle to the watchdog thread. Register deadlines and receive a signal
+/// when the timeout fires.
 #[derive(Clone)]
 pub struct TimeoutWatchdog {
     tx: mpsc::Sender<DeadlineEntry>,
@@ -591,15 +517,6 @@ pub struct TimeoutWatchdog {
 
 /// Global singleton watchdog instance.
 static GLOBAL_WATCHDOG: std::sync::OnceLock<TimeoutWatchdog> = std::sync::OnceLock::new();
-
-/// Sentinel node address used when routing never completed.
-/// Static to avoid repeated allocations at fire time.
-static UNKNOWN_NODE: std::sync::LazyLock<Arc<str>> =
-    std::sync::LazyLock::new(|| Arc::from("unknown"));
-
-/// Atomic phase value constants.
-const PHASE_QUEUED: u8 = 0;
-const PHASE_SENT: u8 = 1;
 
 impl TimeoutWatchdog {
     /// Get or initialize the global shared watchdog instance.
@@ -617,33 +534,17 @@ impl TimeoutWatchdog {
         Self { tx }
     }
 
-    /// Register a timeout. Returns a `oneshot::Receiver<TimeoutEvent>` that
-    /// resolves with diagnostics if the deadline fires.
+    /// Register a timeout. Returns a `oneshot::Receiver<()>` that resolves
+    /// when the deadline fires.
     ///
     /// `submitted_at` should be the caller's `Instant::now()` — shared with
     /// the latency tracking timer to avoid a redundant clock read.
-    ///
-    /// Command name and diagnostic state are read from the `Cmd` (via the
-    /// `Weak` reference) at fire time, not sent through the channel.
     #[inline]
-    pub fn register(
-        &self,
-        timeout: Duration,
-        cmd: std::sync::Weak<redis::Cmd>,
-        submitted_at: Instant,
-        inflight_count: Option<usize>,
-    ) -> oneshot::Receiver<TimeoutEvent> {
+    pub fn register(&self, timeout: Duration, submitted_at: Instant) -> oneshot::Receiver<()> {
+        PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
         let (sender, rx) = oneshot::channel();
         let deadline = submitted_at + timeout;
-
-        let _ = self.tx.send(DeadlineEntry {
-            deadline,
-            sender,
-            cmd,
-            submitted_at,
-            inflight_at_register: inflight_count,
-        });
-
+        let _ = self.tx.send(DeadlineEntry { deadline, sender });
         rx
     }
 
@@ -651,7 +552,6 @@ impl TimeoutWatchdog {
     fn run(rx: mpsc::Receiver<DeadlineEntry>) {
         let mut deadlines: BTreeMap<Instant, Vec<DeadlineEntry>> = BTreeMap::new();
         let mut last_cleanup = Instant::now();
-        let mut last_full_diagnostic = Instant::now() - Duration::from_secs(1); // allow first fire
 
         loop {
             let now = Instant::now();
@@ -660,7 +560,12 @@ impl TimeoutWatchdog {
             // Run at most once per second to amortize cost
             if now.duration_since(last_cleanup) > Duration::from_secs(1) {
                 deadlines.retain(|_, entries| {
+                    let before = entries.len();
                     entries.retain(|e| !e.sender.is_closed());
+                    let removed = before - entries.len();
+                    if removed > 0 {
+                        PENDING_COUNT.fetch_sub(removed, Ordering::Relaxed);
+                    }
                     !entries.is_empty()
                 });
                 last_cleanup = now;
@@ -674,21 +579,11 @@ impl TimeoutWatchdog {
                 let (_, entries) = entry.remove_entry();
                 for e in entries {
                     if e.sender.is_closed() {
+                        PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
                         continue; // Command completed before timeout
                     }
-                    // Rate-limit full diagnostics: at most once per 100ms window.
-                    // During a timeout storm many deadlines fire at once; running
-                    // build_event (with its scan + syscall) for every single one
-                    // would stall the watchdog thread and delay subsequent timeout
-                    // delivery — the exact failure mode the watchdog exists to prevent.
-                    let event =
-                        if now.duration_since(last_full_diagnostic) >= Duration::from_millis(100) {
-                            last_full_diagnostic = now;
-                            Self::build_event(&e, &deadlines)
-                        } else {
-                            Self::build_bare_event(&e)
-                        };
-                    let _ = e.sender.send(event);
+                    let _ = e.sender.send(());
+                    PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
                 }
             }
 
@@ -697,7 +592,9 @@ impl TimeoutWatchdog {
             for _ in 0..MAX_DRAIN_BATCH {
                 match rx.try_recv() {
                     Ok(entry) => {
-                        if !entry.sender.is_closed() {
+                        if entry.sender.is_closed() {
+                            PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                        } else {
                             deadlines.entry(entry.deadline).or_default().push(entry);
                         }
                     }
@@ -723,7 +620,9 @@ impl TimeoutWatchdog {
 
             match wait_result {
                 Ok(entry) => {
-                    if !entry.sender.is_closed() {
+                    if entry.sender.is_closed() {
+                        PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                    } else {
                         deadlines.entry(entry.deadline).or_default().push(entry);
                     }
                 }
@@ -731,186 +630,6 @@ impl TimeoutWatchdog {
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
-    }
-
-    /// Build a lightweight TimeoutEvent without expensive diagnostics (no scan,
-    /// no syscall). Used during timeout storms when a full diagnostic was emitted
-    /// recently. Still provides phase, node, command name, and elapsed time.
-    fn build_bare_event(entry: &DeadlineEntry) -> TimeoutEvent {
-        let now = Instant::now();
-        let actual_elapsed = now.duration_since(entry.submitted_at);
-        let configured_timeout = entry.deadline.duration_since(entry.submitted_at);
-
-        // Try to read diagnostic state from the Cmd. If the Arc was dropped
-        // (command completed), use defaults.
-        let (phase_val, node, retry_count, command) = if let Some(cmd) = entry.cmd.upgrade() {
-            let p = cmd.watchdog_phase.load(Ordering::Acquire);
-            let n: Arc<str> = cmd
-                .watchdog_node
-                .get()
-                .map(|s| Arc::from(s.as_str()))
-                .unwrap_or_else(|| UNKNOWN_NODE.clone());
-            let r = cmd.watchdog_retry_count.load(Ordering::Relaxed);
-            let c = cmd.arg_idx(0).map(cmd_name_from_bytes).unwrap_or("UNKNOWN");
-            (p, n, r, c)
-        } else {
-            (PHASE_QUEUED, UNKNOWN_NODE.clone(), 0, "UNKNOWN")
-        };
-
-        let phase = if phase_val == PHASE_SENT {
-            CommandPhase::Sent
-        } else {
-            CommandPhase::Queued
-        };
-
-        let cause = if phase == CommandPhase::Queued {
-            TimeoutCause::ClientBackpressure {
-                queue_depth: 0,
-                scheduling_delay: actual_elapsed,
-            }
-        } else {
-            TimeoutCause::ServerUnresponsive { node: node.clone() }
-        };
-
-        TimeoutEvent {
-            cause,
-            command,
-            node,
-            phase,
-            configured_timeout,
-            actual_elapsed,
-            pending_commands: 0,
-            same_node_pending: 0,
-            recent_p99_latency: None,
-            rss_bytes: None,
-            suggested_timeout: None,
-            inflight_at_register: entry.inflight_at_register,
-            inflight_at_timeout: None,
-            retry_count,
-        }
-    }
-
-    /// Build a TimeoutEvent with full diagnostics. Only called at fire time (rare),
-    /// and rate-limited to at most once per 100ms window.
-    fn build_event(
-        entry: &DeadlineEntry,
-        deadlines: &BTreeMap<Instant, Vec<DeadlineEntry>>,
-    ) -> TimeoutEvent {
-        let now = Instant::now();
-        let actual_elapsed = now.duration_since(entry.submitted_at);
-        let configured_timeout = entry.deadline.duration_since(entry.submitted_at);
-
-        // Try to read diagnostic state from the Cmd.
-        let (phase_val, node, retry_count, command) = if let Some(cmd) = entry.cmd.upgrade() {
-            let p = cmd.watchdog_phase.load(Ordering::Acquire);
-            let n: Arc<str> = cmd
-                .watchdog_node
-                .get()
-                .map(|s| Arc::from(s.as_str()))
-                .unwrap_or_else(|| UNKNOWN_NODE.clone());
-            let r = cmd.watchdog_retry_count.load(Ordering::Relaxed);
-            let c = cmd.arg_idx(0).map(cmd_name_from_bytes).unwrap_or("UNKNOWN");
-            (p, n, r, c)
-        } else {
-            (PHASE_QUEUED, UNKNOWN_NODE.clone(), 0, "UNKNOWN")
-        };
-
-        let phase = if phase_val == PHASE_SENT {
-            CommandPhase::Sent
-        } else {
-            CommandPhase::Queued
-        };
-
-        // Count pending commands (total and same-node)
-        // Bounded scan to avoid O(n) stall during timeout storms
-        let mut pending_total = 0usize;
-        let mut same_node_pending = 0usize;
-        const MAX_SCAN: usize = 1024;
-        let mut scanned = 0;
-        'outer: for entries in deadlines.values() {
-            for e in entries {
-                if scanned >= MAX_SCAN {
-                    break 'outer;
-                }
-                scanned += 1;
-                if !e.sender.is_closed() {
-                    pending_total += 1;
-                    if let Some(e_cmd) = e.cmd.upgrade()
-                        && let Some(e_node) = e_cmd.watchdog_node.get()
-                        && e_node.as_str() == node.as_ref()
-                    {
-                        same_node_pending += 1;
-                    }
-                }
-            }
-        }
-
-        let rss_bytes = get_rss();
-
-        // Classify the cause
-        let cause = Self::classify(
-            phase,
-            &node,
-            actual_elapsed,
-            configured_timeout,
-            same_node_pending,
-            pending_total,
-            rss_bytes,
-        );
-
-        TimeoutEvent {
-            cause,
-            command,
-            node,
-            phase,
-            configured_timeout,
-            actual_elapsed,
-            pending_commands: pending_total,
-            same_node_pending,
-            recent_p99_latency: None, // Enriched by consumer
-            rss_bytes,
-            suggested_timeout: None, // Enriched by consumer
-            inflight_at_register: entry.inflight_at_register,
-            inflight_at_timeout: None, // Enriched by consumer
-            retry_count,
-        }
-    }
-
-    fn classify(
-        phase: CommandPhase,
-        node: &Arc<str>,
-        _actual_elapsed: Duration,
-        _configured_timeout: Duration,
-        same_node_pending: usize,
-        pending_total: usize,
-        rss_bytes: Option<u64>,
-    ) -> TimeoutCause {
-        // Client never sent the command — backpressure or Tokio starvation
-        if phase == CommandPhase::Queued {
-            return TimeoutCause::ClientBackpressure {
-                queue_depth: pending_total,
-                scheduling_delay: _actual_elapsed,
-            };
-        }
-
-        // Majority of pending commands target the same node
-        if same_node_pending > 5 && same_node_pending > pending_total / 2 {
-            return TimeoutCause::NodeDegraded {
-                node: node.clone(),
-                concurrent_timeouts: same_node_pending,
-            };
-        }
-
-        // High overall pending count — system-wide problem
-        if pending_total > 100 {
-            return TimeoutCause::SystemOverload {
-                pending_total,
-                rss_bytes,
-            };
-        }
-
-        // Default: server didn't respond
-        TimeoutCause::ServerUnresponsive { node: node.clone() }
     }
 }
 
@@ -920,44 +639,20 @@ impl TimeoutWatchdog {
 mod tests {
     use super::*;
 
-    /// Helper: create an Arc<Cmd> for use in tests.
-    fn make_cmd() -> Arc<redis::Cmd> {
-        Arc::new(redis::cmd("GET"))
-    }
-
     // ── Basic Firing Behavior ────────────────────────────────────────────
 
     #[tokio::test]
-    async fn fires_with_diagnostic_event() {
+    async fn fires_on_deadline() {
         let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(
-            Duration::from_millis(50),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let event = rx.await.unwrap();
-        assert_eq!(event.command, "GET");
-        assert_eq!(event.node.as_ref(), "127.0.0.1:6379");
-        assert_eq!(event.phase, CommandPhase::Sent);
-        assert!(event.actual_elapsed >= Duration::from_millis(50));
-        assert!(event.actual_elapsed < Duration::from_millis(150));
-        assert_eq!(event.configured_timeout, Duration::from_millis(50));
+        let rx = watchdog.register(Duration::from_millis(50), Instant::now());
+        let result = rx.await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn does_not_fire_before_deadline() {
         let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        let mut rx = watchdog.register(
-            Duration::from_millis(200),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
+        let mut rx = watchdog.register(Duration::from_millis(200), Instant::now());
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
     }
@@ -965,227 +660,78 @@ mod tests {
     #[tokio::test]
     async fn multiple_deadlines_fire_in_order() {
         let watchdog = TimeoutWatchdog::start();
-        let cmd1 = make_cmd();
-        let cmd2 = Arc::new(redis::cmd("SET"));
-        cmd1.mark_sent("127.0.0.1:6379");
-        cmd2.mark_sent("127.0.0.1:6379");
-        let rx1 = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd1),
-            Instant::now(),
-            None,
-        );
-        let rx2 = watchdog.register(
-            Duration::from_millis(60),
-            Arc::downgrade(&cmd2),
-            Instant::now(),
-            None,
-        );
+        let rx1 = watchdog.register(Duration::from_millis(30), Instant::now());
+        let rx2 = watchdog.register(Duration::from_millis(60), Instant::now());
 
-        let event1 = rx1.await.unwrap();
+        let _ = rx1.await.unwrap();
         let mid = Instant::now();
-        let event2 = rx2.await.unwrap();
+        let _ = rx2.await.unwrap();
         let end = Instant::now();
 
-        assert_eq!(event1.command, "GET");
-        assert_eq!(event2.command, "SET");
         assert!(end.duration_since(mid) >= Duration::from_millis(20));
     }
 
     #[tokio::test]
     async fn cancelled_before_deadline_does_not_fire() {
         let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        let rx = watchdog.register(
-            Duration::from_millis(200),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
+        let rx = watchdog.register(Duration::from_millis(200), Instant::now());
         drop(rx);
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    // ── Phase Tracking ───────────────────────────────────────────────────
+    // ── Pending Count ────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn phase_defaults_to_queued() {
+    async fn pending_count_increments_and_decrements() {
         let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
+        let before = pending_count();
 
-        let event = rx.await.unwrap();
-        assert_eq!(event.phase, CommandPhase::Queued);
-    }
+        let rx1 = watchdog.register(Duration::from_millis(50), Instant::now());
+        let rx2 = watchdog.register(Duration::from_millis(50), Instant::now());
 
-    #[tokio::test]
-    async fn phase_transitions_to_sent() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let event = rx.await.unwrap();
-        assert_eq!(event.phase, CommandPhase::Sent);
-    }
-
-    #[tokio::test]
-    async fn late_phase_transition_captured() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        let rx = watchdog.register(
-            Duration::from_millis(80),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        cmd.mark_sent("127.0.0.1:6379");
-
-        let event = rx.await.unwrap();
-        assert_eq!(event.phase, CommandPhase::Sent);
-    }
-
-    // ── Classification Logic ─────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn classifies_client_backpressure_when_queued() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let event = rx.await.unwrap();
-        assert!(matches!(
-            event.cause,
-            TimeoutCause::ClientBackpressure { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn classifies_server_unresponsive_single_command() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let event = rx.await.unwrap();
-        assert!(matches!(
-            event.cause,
-            TimeoutCause::ServerUnresponsive { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn classifies_node_degraded_many_same_node() {
-        let watchdog = TimeoutWatchdog::start();
-        let mut receivers = Vec::new();
-        let mut cmds = Vec::new();
-        for _ in 0..10 {
-            let cmd = make_cmd();
-            cmd.mark_sent("10.0.0.1:6379");
-            let rx = watchdog.register(
-                Duration::from_millis(50),
-                Arc::downgrade(&cmd),
-                Instant::now(),
-                None,
-            );
-            cmds.push(cmd);
-            receivers.push(rx);
-        }
-
-        let event = receivers.remove(0).await.unwrap();
+        // Give the watchdog thread time to process
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let during = pending_count();
         assert!(
-            matches!(&event.cause, TimeoutCause::NodeDegraded { concurrent_timeouts, .. } if *concurrent_timeouts >= 5)
+            during >= before + 2,
+            "pending should increase: before={before}, during={during}"
         );
-        assert!(event.same_node_pending >= 5);
+
+        // Wait for both to fire
+        let _ = rx1.await;
+        let _ = rx2.await;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let after = pending_count();
+        // After firing, count should have decreased by at least 2
+        assert!(
+            after <= during - 2,
+            "pending should decrease after fire: during={during}, after={after}"
+        );
     }
 
     #[tokio::test]
-    async fn classifies_system_overload_many_nodes() {
+    async fn pending_count_decrements_on_cancel() {
         let watchdog = TimeoutWatchdog::start();
-        let mut receivers = Vec::new();
-        let mut cmds = Vec::new();
-        for i in 0..110 {
-            let cmd = make_cmd();
-            cmd.mark_sent(&format!("10.0.0.{}:6379", i % 50));
-            let rx = watchdog.register(
-                Duration::from_millis(50),
-                Arc::downgrade(&cmd),
-                Instant::now(),
-                None,
-            );
-            cmds.push(cmd);
-            receivers.push(rx);
-        }
+        let before = pending_count();
 
-        let event = receivers.remove(0).await.unwrap();
-        assert!(matches!(event.cause, TimeoutCause::SystemOverload { .. }));
-    }
+        let rx = watchdog.register(Duration::from_secs(10), Instant::now());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let during = pending_count();
+        assert!(during >= before + 1);
 
-    // ── Pending Command Counts ───────────────────────────────────────────
+        // Drop receiver (cancel)
+        drop(rx);
 
-    #[tokio::test]
-    async fn reports_pending_command_counts() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd_target = make_cmd();
-        cmd_target.mark_sent("10.0.0.1:6379");
-        let rx_target = watchdog.register(
-            Duration::from_millis(50),
-            Arc::downgrade(&cmd_target),
-            Instant::now(),
-            None,
+        // The cleanup runs every second in the watchdog thread.
+        // Wait for periodic cleanup.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let after = pending_count();
+        // After cleanup, count should have decreased by at least 1
+        assert!(
+            after < during,
+            "pending should decrease after cancel: during={during}, after={after}"
         );
-        let mut _holders = Vec::new();
-        let mut _cmd_holders = Vec::new();
-        for _ in 0..2 {
-            let cmd = make_cmd();
-            cmd.mark_sent("10.0.0.1:6379");
-            let rx = watchdog.register(
-                Duration::from_millis(50),
-                Arc::downgrade(&cmd),
-                Instant::now(),
-                None,
-            );
-            _cmd_holders.push(cmd);
-            _holders.push(rx);
-        }
-        for _ in 0..2 {
-            let cmd = Arc::new(redis::cmd("SET"));
-            cmd.mark_sent("10.0.0.2:6379");
-            let rx = watchdog.register(
-                Duration::from_millis(50),
-                Arc::downgrade(&cmd),
-                Instant::now(),
-                None,
-            );
-            _cmd_holders.push(cmd);
-            _holders.push(rx);
-        }
-
-        let event = rx_target.await.unwrap();
-        assert!(event.pending_commands >= 4);
-        assert!(event.same_node_pending >= 2);
     }
 
     // ── Latency Tracker ──────────────────────────────────────────────────
@@ -1221,101 +767,6 @@ mod tests {
         assert!(p99 <= Duration::from_millis(20));
     }
 
-    #[tokio::test]
-    async fn timeout_event_includes_p99_from_tracker() {
-        let watchdog = TimeoutWatchdog::start();
-        let tracker = Arc::new(LatencyTracker::new(100));
-        for i in 1..=100 {
-            tracker.record(Duration::from_millis(i));
-        }
-
-        let cmd = make_cmd();
-        cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let event = rx.await.unwrap();
-        // p99 enrichment is now done by the consumer (client/mod.rs),
-        // not by the watchdog. Verify the watchdog returns None.
-        assert!(event.recent_p99_latency.is_none());
-    }
-
-    // ── Suggested Timeout ────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn suggested_timeout_is_none_from_watchdog() {
-        // suggested_timeout is now computed by the consumer, not the watchdog.
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(
-            Duration::from_millis(20),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let event = rx.await.unwrap();
-        assert!(event.suggested_timeout.is_none());
-    }
-
-    #[tokio::test]
-    async fn p99_computed_by_latency_tracker_directly() {
-        // Verify LatencyTracker.p99() still works for consumer-side enrichment
-        let tracker = LatencyTracker::new(100);
-        for _ in 0..100 {
-            tracker.record(Duration::from_millis(10));
-        }
-        let p99 = tracker.p99().unwrap();
-        // 3x p99 = ~30ms — consumer would compute this
-        let suggested = (p99 * 3).max(Duration::from_millis(20));
-        assert!(suggested >= Duration::from_millis(28));
-        assert!(suggested <= Duration::from_millis(35));
-    }
-
-    #[tokio::test]
-    async fn no_suggested_timeout_without_tracker() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let event = rx.await.unwrap();
-        assert!(event.suggested_timeout.is_none());
-    }
-
-    // ── RSS Diagnostics ──────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn rss_is_populated_on_supported_platforms() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let event = rx.await.unwrap();
-        if cfg!(any(target_os = "linux", target_os = "macos")) {
-            assert!(event.rss_bytes.is_some());
-            assert!(event.rss_bytes.unwrap() > 0);
-        } else {
-            assert!(event.rss_bytes.is_none());
-        }
-    }
-
     // ── Concurrency & Throughput ─────────────────────────────────────────
 
     #[tokio::test]
@@ -1323,16 +774,8 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         let start = Instant::now();
         let mut receivers = Vec::with_capacity(10_000);
-        let mut cmds = Vec::with_capacity(10_000);
         for _ in 0..10_000 {
-            let cmd = make_cmd();
-            let rx = watchdog.register(
-                Duration::from_secs(60),
-                Arc::downgrade(&cmd),
-                Instant::now(),
-                None,
-            );
-            cmds.push(cmd);
+            let rx = watchdog.register(Duration::from_secs(60), Instant::now());
             receivers.push(rx);
         }
         let elapsed = start.elapsed();
@@ -1342,32 +785,19 @@ mod tests {
             elapsed
         );
         drop(receivers);
-        drop(cmds);
     }
 
     #[tokio::test]
     async fn completed_commands_dont_accumulate() {
         let watchdog = TimeoutWatchdog::start();
         for _ in 0..1000 {
-            let cmd = make_cmd();
-            let _rx = watchdog.register(
-                Duration::from_secs(1),
-                Arc::downgrade(&cmd),
-                Instant::now(),
-                None,
-            );
+            let _rx = watchdog.register(Duration::from_secs(1), Instant::now());
+            // rx is immediately dropped — simulates command completing
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let cmd = make_cmd();
-        cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
+        let rx = watchdog.register(Duration::from_millis(30), Instant::now());
         let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
         assert!(
             result.is_ok(),
@@ -1383,21 +813,12 @@ mod tests {
             let w = watchdog.clone();
             handles.push(tokio::spawn(async move {
                 let mut rxs = Vec::new();
-                let mut cmds = Vec::new();
                 for _ in 0..100 {
-                    let cmd = Arc::new(redis::cmd("GET"));
-                    cmd.mark_sent("127.0.0.1:6379");
-                    let rx = w.register(
-                        Duration::from_millis(50),
-                        Arc::downgrade(&cmd),
-                        Instant::now(),
-                        None,
-                    );
-                    cmds.push(cmd);
+                    let rx = w.register(Duration::from_millis(50), Instant::now());
                     rxs.push(rx);
                 }
                 for rx in rxs {
-                    rx.await.unwrap();
+                    let _ = rx.await;
                 }
             }));
         }
@@ -1411,13 +832,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn watchdog_fires_under_tokio_starvation() {
         let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        let rx = watchdog.register(
-            Duration::from_millis(100),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
+        let rx = watchdog.register(Duration::from_millis(100), Instant::now());
 
         let blocker = tokio::spawn(async {
             let start = Instant::now();
@@ -1435,90 +850,7 @@ mod tests {
         blocker.abort();
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn starvation_produces_diagnostic_event() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        let rx = watchdog.register(
-            Duration::from_millis(80),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let blocker = tokio::spawn(async {
-            let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(2) {
-                tokio::task::yield_now().await;
-                std::thread::sleep(Duration::from_millis(30));
-            }
-        });
-
-        let result = tokio::time::timeout(Duration::from_secs(1), rx).await;
-        assert!(result.is_ok());
-        let event = result.unwrap().unwrap();
-        assert_eq!(event.phase, CommandPhase::Queued);
-        assert!(matches!(
-            event.cause,
-            TimeoutCause::ClientBackpressure { .. }
-        ));
-        assert_eq!(event.command, "GET");
-        blocker.abort();
-    }
-
-    // ── Display / Debug ──────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn timeout_event_is_debug_printable() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let event = rx.await.unwrap();
-        let debug_str = format!("{:?}", event);
-        assert!(debug_str.contains("GET"));
-        assert!(debug_str.contains("127.0.0.1:6379"));
-        assert!(debug_str.contains("ServerUnresponsive"));
-    }
-
-    // ── Wiring Verification ──────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn inline_cmd_fields_set_node_and_phase() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = Arc::new(redis::cmd("SET"));
-        let rx = watchdog.register(
-            Duration::from_millis(50),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        cmd.mark_sent("10.0.0.5:6379");
-
-        let event = rx.await.unwrap();
-        assert_eq!(event.command, "SET");
-        assert_eq!(event.node.as_ref(), "10.0.0.5:6379");
-        assert_eq!(event.phase, CommandPhase::Sent);
-    }
-
-    #[tokio::test]
-    async fn mark_sent_updates_cmd_inline_fields() {
-        let cmd = Arc::new(redis::cmd("GET"));
-        cmd.mark_sent("192.168.1.1:6379");
-
-        assert_eq!(
-            cmd.watchdog_node.get().unwrap().as_str(),
-            "192.168.1.1:6379"
-        );
-        assert_eq!(cmd.watchdog_phase.load(Ordering::Acquire), PHASE_SENT);
-    }
+    // ── cmd_name_from_bytes ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn cmd_name_from_bytes_resolves_common_commands() {
@@ -1540,43 +872,5 @@ mod tests {
         assert_eq!(cmd_name_from_bytes(b"PEXPIREAT"), "PEXPIREAT");
         assert_eq!(cmd_name_from_bytes(b"INCRBYFLOAT"), "INCRBYFLOAT");
         assert_eq!(cmd_name_from_bytes(b"unknowncmd"), "UNKNOWN");
-    }
-
-    #[tokio::test]
-    async fn timeout_without_mark_sent_reports_queued_and_unknown_node() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            None,
-        );
-
-        let event = rx.await.unwrap();
-        assert_eq!(event.phase, CommandPhase::Queued);
-        assert_eq!(event.node.as_ref(), "unknown");
-        assert!(matches!(
-            event.cause,
-            TimeoutCause::ClientBackpressure { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn inflight_count_propagated_to_event() {
-        let watchdog = TimeoutWatchdog::start();
-        let cmd = make_cmd();
-        cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(
-            Duration::from_millis(30),
-            Arc::downgrade(&cmd),
-            Instant::now(),
-            Some(42),
-        );
-
-        let event = rx.await.unwrap();
-        assert_eq!(event.inflight_at_register, Some(42));
-        // inflight_at_timeout is now enriched by the consumer, not the watchdog
-        assert_eq!(event.inflight_at_timeout, None);
     }
 }
