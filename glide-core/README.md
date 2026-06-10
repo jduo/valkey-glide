@@ -63,6 +63,16 @@ If the environment variable is not set, DNS tests will be skipped.
 
 The timeout watchdog provides structured diagnostic information when command timeouts occur. It runs on a dedicated OS thread independent of the Tokio runtime, guaranteeing timeout delivery even under runtime starvation.
 
+### Architecture
+
+The watchdog is a **pure timer** — it signals "timeout fired" with a bare `()` via a oneshot channel. All diagnostic enrichment (cause classification, latency percentiles, inflight counts, RSS) happens on the consumer side (`send_command`) at fire time. This keeps the hot path minimal:
+
+- **Register** (~100ns): `Instant::now()` + oneshot channel + mpsc send + atomic increment
+- **Mark sent** (zero-alloc): stores node address inline (stack, up to 63 bytes) via `OnceLock<NodeAddr>` on the `Cmd` struct
+- **Fire path** (rare): builds `TimeoutEvent` with classified cause, p99 latency, inflight trend, and process RSS
+
+No `Arc`, `Mutex`, or heap allocation on the per-command hot path beyond the oneshot channel.
+
 ### Enabling
 
 Diagnostics are enabled automatically when a `request_timeout` is configured on the client. No additional configuration is needed. Timeout events are emitted via `log_warn` at the `"timeout_watchdog"` log target.
