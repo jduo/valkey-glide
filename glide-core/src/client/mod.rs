@@ -1117,87 +1117,94 @@ impl Client {
             let self_clone = self.clone();
             let owned_cmd = cmd.clone();
 
-            let result = match request_timeout {
-                Some(duration) => {
-                    // Resolve command name from raw bytes (zero allocation)
-                    let cmd_name = owned_cmd
-                        .arg_idx(0)
-                        .map(crate::timeout_watchdog::cmd_name_from_bytes)
-                        .unwrap_or("UNKNOWN");
+            let result =
+                match request_timeout {
+                    Some(duration) => {
+                        // Resolve command name from raw bytes (zero allocation)
+                        let cmd_name = owned_cmd
+                            .arg_idx(0)
+                            .map(crate::timeout_watchdog::cmd_name_from_bytes)
+                            .unwrap_or("UNKNOWN");
 
-                    // Compute inflight count (cheap atomic load)
-                    let inflight = Some(
-                        (self.inflight_requests_limit
-                            - self.inflight_requests_allowed.load(Ordering::Relaxed))
-                            as usize,
-                    );
+                        // Compute inflight count (cheap atomic load)
+                        let inflight = Some(
+                            (self.inflight_requests_limit
+                                - self.inflight_requests_allowed.load(Ordering::Relaxed))
+                                as usize,
+                        );
 
-                    // Wrap Cmd in Arc BEFORE register so we can pass a Weak reference
-                    let owned_cmd = Arc::new(owned_cmd);
+                        // Wrap Cmd in Arc BEFORE register so we can pass a Weak reference
+                        let owned_cmd = Arc::new(owned_cmd);
 
-                    let timeout_rx = crate::timeout_watchdog::TimeoutWatchdog::global().register(
-                        duration,
-                        cmd_name,
-                        Arc::downgrade(&owned_cmd),
-                        Some(self.latency_tracker.clone()),
-                        inflight,
-                        Some(self.inflight_requests_allowed.clone()),
-                        self.inflight_requests_limit,
-                    );
-                    let execute = Self::execute_command_owned(
-                        self_clone,
-                        owned_cmd,
-                        routing,
-                        client,
-                        compression_manager,
-                    );
+                        let timeout_rx = crate::timeout_watchdog::TimeoutWatchdog::global()
+                            .register(duration, cmd_name, Arc::downgrade(&owned_cmd), inflight);
+                        let execute = Self::execute_command_owned(
+                            self_clone,
+                            owned_cmd,
+                            routing,
+                            client,
+                            compression_manager,
+                        );
 
-                    let cmd_start = Instant::now();
-                    tokio::pin!(execute);
-                    tokio::select! {
-                        result = &mut execute => {
-                            // Record latency into per-client tracker
-                            let elapsed = cmd_start.elapsed();
-                            self.latency_tracker.record(elapsed);
-                            result
-                        }
-                        recv_result = timeout_rx => {
-                            match recv_result {
-                                Err(_) => {
-                                    // Watchdog thread died — fall through to let the
-                                    // command complete via Tokio's timer as fallback.
-                                    execute.await
-                                }
-                                Ok(event) => {
-                                    log_warn_rate_limited!(
-                                        "timeout_watchdog",
-                                        2,
-                                        event.to_string()
-                                    );
-                                    if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
-                                        log_error(
-                                            "OpenTelemetry:timeout_error",
-                                            format!("Failed to record timeout error: {e}"),
-                                        );
+                        let cmd_start = Instant::now();
+                        tokio::pin!(execute);
+                        tokio::select! {
+                            result = &mut execute => {
+                                // Record latency into per-client tracker
+                                let elapsed = cmd_start.elapsed();
+                                self.latency_tracker.record(elapsed);
+                                result
+                            }
+                            recv_result = timeout_rx => {
+                                match recv_result {
+                                    Err(_) => {
+                                        // Watchdog thread died — fall through to let the
+                                        // command complete via Tokio's timer as fallback.
+                                        execute.await
                                     }
-                                    Err(io::Error::from(io::ErrorKind::TimedOut).into())
+                                    Ok(mut event) => {
+                                        // Enrich with per-client diagnostics (consumer side
+                                        // — avoids Arc clones on the hot path)
+                                        event.inflight_at_timeout = Some(
+                                            (self.inflight_requests_limit
+                                                - self.inflight_requests_allowed
+                                                    .load(Ordering::Relaxed))
+                                                as usize,
+                                        );
+                                        let p99 = self.latency_tracker.p99();
+                                        event.recent_p99_latency = p99;
+                                        event.suggested_timeout =
+                                            p99.map(|p| (p * 3).max(duration));
+
+                                        log_warn_rate_limited!(
+                                            "timeout_watchdog",
+                                            2,
+                                            event.to_string()
+                                        );
+                                        if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
+                                            log_error(
+                                                "OpenTelemetry:timeout_error",
+                                                format!("Failed to record timeout error: {e}"),
+                                            );
+                                        }
+                                        Err(io::Error::from(io::ErrorKind::TimedOut).into())
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                None => {
-                    let owned_cmd = Arc::new(owned_cmd);
-                    let execute = Self::execute_command_owned(
-                        self_clone,
-                        owned_cmd,
-                        routing,
-                        client,
-                        compression_manager,
-                    );
-                    execute.await
-                }
-            };
+                    None => {
+                        let owned_cmd = Arc::new(owned_cmd);
+                        let execute = Self::execute_command_owned(
+                            self_clone,
+                            owned_cmd,
+                            routing,
+                            client,
+                            compression_manager,
+                        );
+                        execute.await
+                    }
+                };
 
             // Report result to client-wide circuit breaker
             if let Some(cb) = &self.circuit_breaker {
