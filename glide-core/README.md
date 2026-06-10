@@ -75,7 +75,7 @@ When a timeout fires, a structured log line is emitted:
 Timeout: cmd=GET node=10.0.0.1:6379 cause=ServerUnresponsive phase=Sent
   elapsed=252ms configured=250ms pending=47
   inflight=850→920 BUILDING (backpressure increasing during timeout window)
-  p99=15ms suggested_timeout=45ms
+  p99=15ms suggested_timeout=45ms rss=384MB
 ```
 
 ### Interpreting the Fields
@@ -92,6 +92,7 @@ Timeout: cmd=GET node=10.0.0.1:6379 cause=ServerUnresponsive phase=Sent
 | `inflight` | Format: `at_register→at_timeout`. Shows how backpressure changed during the timeout window |
 | `p99` | Recent p99 latency for this client (from the last 4096 commands) |
 | `suggested_timeout` | 3× observed p99, floored at the configured timeout |
+| `rss` | Process resident set size in MB at fire time (Linux/macOS) |
 
 ### Timeout Causes
 

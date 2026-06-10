@@ -382,6 +382,8 @@ pub struct TimeoutEvent {
     pub pending_commands: usize,
     /// Recent p99 latency for the target node (if available).
     pub recent_p99_latency: Option<Duration>,
+    /// Process RSS in bytes at fire time (Linux/macOS).
+    pub rss_bytes: Option<u64>,
     /// Suggested timeout based on recent latency observations.
     pub suggested_timeout: Option<Duration>,
     /// Number of inflight requests when the command was submitted.
@@ -390,6 +392,71 @@ pub struct TimeoutEvent {
     pub inflight_at_timeout: Option<usize>,
     /// Number of retries attempted before this timeout.
     pub retry_count: u8,
+}
+
+/// Returns the process RSS in bytes. Cached for 1 second to avoid redundant
+/// syscalls during timeout storms (many timeouts fire within milliseconds).
+/// - Linux: reads /proc/self/statm (single read, no alloc beyond stack buffer)
+/// - macOS: mach_task_basic_info syscall (~200ns, no fork)
+/// - Other: None
+pub fn get_rss() -> Option<u64> {
+    use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
+
+    static CACHED_RSS: AtomicU64 = AtomicU64::new(0);
+    static CACHED_AT: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
+
+    let mutex = CACHED_AT.get_or_init(|| std::sync::Mutex::new(Instant::now() - Duration::from_secs(10)));
+    // Fast path: check if cache is fresh
+    if let Ok(last) = mutex.try_lock()
+        && last.elapsed() < Duration::from_secs(1)
+    {
+        let val = CACHED_RSS.load(AOrdering::Relaxed);
+        return if val == 0 { None } else { Some(val) };
+    }
+
+    let rss = get_rss_inner();
+    CACHED_RSS.store(rss.unwrap_or(0), AOrdering::Relaxed);
+    if let Ok(mut last) = mutex.try_lock() {
+        *last = Instant::now();
+    }
+    rss
+}
+
+fn get_rss_inner() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        Some(resident_pages * page_size)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::mem::MaybeUninit;
+        #[allow(deprecated)]
+        let task = unsafe { libc::mach_task_self_ };
+        let mut info = MaybeUninit::<libc::mach_task_basic_info_data_t>::uninit();
+        let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
+            / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
+        #[allow(deprecated)]
+        let kr = unsafe {
+            libc::task_info(
+                task,
+                libc::MACH_TASK_BASIC_INFO,
+                info.as_mut_ptr() as libc::task_info_t,
+                &mut count,
+            )
+        };
+        if kr == libc::KERN_SUCCESS {
+            Some(unsafe { info.assume_init() }.resident_size)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 impl std::fmt::Display for TimeoutEvent {
@@ -425,6 +492,9 @@ impl std::fmt::Display for TimeoutEvent {
         }
         if self.retry_count > 0 {
             write!(f, " retries={}", self.retry_count)?;
+        }
+        if let Some(rss) = self.rss_bytes {
+            write!(f, " rss={}MB", rss / (1024 * 1024))?;
         }
         Ok(())
     }

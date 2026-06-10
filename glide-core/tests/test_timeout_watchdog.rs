@@ -270,3 +270,24 @@ async fn watchdog_fires_under_tokio_starvation() {
     );
     blocker.abort();
 }
+
+// ─── RSS Diagnostic ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_rss_returns_nonzero_on_supported_platforms() {
+    let rss = glide_core::timeout_watchdog::get_rss();
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        let bytes = rss.expect("get_rss() should return Some on Linux/macOS");
+        assert!(bytes > 0, "RSS should be non-zero, got {bytes}");
+        // Sanity: a Rust test binary is at least a few MB
+        assert!(bytes > 1_000_000, "RSS suspiciously low: {bytes} bytes");
+    }
+}
+
+#[tokio::test]
+async fn get_rss_caches_result() {
+    // Two calls within 1s should return the same value (cached).
+    let rss1 = glide_core::timeout_watchdog::get_rss();
+    let rss2 = glide_core::timeout_watchdog::get_rss();
+    assert_eq!(rss1, rss2, "consecutive get_rss() calls should return cached value");
+}

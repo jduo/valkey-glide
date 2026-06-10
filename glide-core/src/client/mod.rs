@@ -1208,6 +1208,7 @@ impl Client {
                                         actual_elapsed,
                                         pending_commands: pending,
                                         recent_p99_latency: p99,
+                                        rss_bytes: crate::timeout_watchdog::get_rss(),
                                         suggested_timeout: p99.map(|p| (p * 3).max(duration)),
                                         inflight_at_register: inflight,
                                         inflight_at_timeout: Some(inflight_now),
