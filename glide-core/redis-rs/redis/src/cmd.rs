@@ -23,6 +23,73 @@ pub enum Arg<D> {
     Cursor,
 }
 
+/// Compact inline node address storage. Avoids heap allocation for addresses
+/// up to 63 bytes (covers all realistic host:port strings like "10.0.0.1:6379"
+/// or "my-cluster-node.example.com:6379"). Falls back to heap for longer.
+#[derive(Clone)]
+pub enum NodeAddr {
+    /// Stack-allocated address (up to 63 bytes).
+    Inline { buf: [u8; 63], len: u8 },
+    /// Heap-allocated for addresses > 63 bytes (extremely rare in practice).
+    Heap(String),
+}
+
+impl NodeAddr {
+    /// Create a NodeAddr from a borrowed string slice. Stack-allocated if ≤63 bytes.
+    #[inline]
+    pub fn new(s: &str) -> Self {
+        if s.len() <= 63 {
+            let mut buf = [0u8; 63];
+            buf[..s.len()].copy_from_slice(s.as_bytes());
+            Self::Inline {
+                buf,
+                len: s.len() as u8,
+            }
+        } else {
+            Self::Heap(s.to_owned())
+        }
+    }
+
+    /// Create a NodeAddr from an owned String. Stack-allocated if ≤63 bytes.
+    #[inline]
+    pub fn from_owned(s: String) -> Self {
+        if s.len() <= 63 {
+            let mut buf = [0u8; 63];
+            buf[..s.len()].copy_from_slice(s.as_bytes());
+            Self::Inline {
+                buf,
+                len: s.len() as u8,
+            }
+        } else {
+            Self::Heap(s)
+        }
+    }
+
+    /// Get the address as a string slice.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Inline { buf, len } => {
+                // SAFETY: we only store valid UTF-8 from &str or String
+                unsafe { std::str::from_utf8_unchecked(&buf[..*len as usize]) }
+            }
+            Self::Heap(s) => s.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Debug for NodeAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("NodeAddr").field(&self.as_str()).finish()
+    }
+}
+
+impl std::fmt::Display for NodeAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Atomic phase value: command is queued but not yet sent.
 pub const PHASE_QUEUED: u8 = 0;
 /// Atomic phase value: command has been sent to a node.
@@ -52,8 +119,9 @@ pub struct Cmd {
     /// Inline watchdog phase: 0 = Queued, 1 = Sent. Updated atomically by the
     /// routing layer after connection resolution.
     pub watchdog_phase: AtomicU8,
-    /// The resolved node address. Set once by the routing layer.
-    pub watchdog_node: std::sync::OnceLock<String>,
+    /// The resolved node address. Set once by the routing layer. Uses inline
+    /// storage (no heap alloc) for addresses up to 63 bytes.
+    pub watchdog_node: std::sync::OnceLock<NodeAddr>,
     /// Number of retries attempted. Incremented by the routing layer.
     pub watchdog_retry_count: AtomicU8,
 }
@@ -738,18 +806,18 @@ impl Cmd {
 
     /// Mark the command as sent and record the resolved node address.
     /// Called from the routing layer after connection resolution.
-    /// Accepts a borrowed `&str` and clones it into the OnceLock.
+    /// Zero heap allocation for addresses ≤63 bytes (inline storage).
     #[inline]
     pub fn mark_sent(&self, node_address: &str) {
-        let _ = self.watchdog_node.set(node_address.to_owned());
+        let _ = self.watchdog_node.set(NodeAddr::new(node_address));
         self.watchdog_phase.store(PHASE_SENT, Ordering::Release);
     }
 
-    /// Like `mark_sent` but takes an owned String, avoiding a re-allocation
-    /// when the caller already has one (e.g. standalone `node_address()`).
+    /// Like `mark_sent` but takes an owned String. Zero heap allocation for
+    /// addresses ≤63 bytes; for longer addresses, moves the String without copying.
     #[inline]
     pub fn mark_sent_owned(&self, node_address: String) {
-        let _ = self.watchdog_node.set(node_address);
+        let _ = self.watchdog_node.set(NodeAddr::from_owned(node_address));
         self.watchdog_phase.store(PHASE_SENT, Ordering::Release);
     }
 
