@@ -1162,9 +1162,9 @@ impl Client {
                                     let actual_elapsed = cmd_start.elapsed();
                                     let (phase, node, retry_count, command) = {
                                         let p = owned_cmd.watchdog_phase.load(Ordering::Acquire);
-                                        let n: Arc<str> = owned_cmd.watchdog_node.get()
-                                            .map(|na| Arc::from(na.as_str()))
-                                            .unwrap_or_else(|| Arc::from("unknown"));
+                                        let n: String = owned_cmd.watchdog_node.get()
+                                            .map(|na| na.as_str().to_owned())
+                                            .unwrap_or_else(|| "unknown".to_owned());
                                         let r = owned_cmd.watchdog_retry_count.load(Ordering::Relaxed);
                                         let c = owned_cmd.arg_idx(0)
                                             .map(crate::timeout_watchdog::cmd_name_from_bytes)

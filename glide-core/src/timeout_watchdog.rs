@@ -9,7 +9,6 @@
 //! All diagnostic event construction moves to the consumer side (`client/mod.rs`).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -332,12 +331,22 @@ pub fn cmd_name_from_bytes(bytes: &[u8]) -> &'static str {
     .unwrap_or("UNKNOWN")
 }
 fn match_upper(input: &[u8], table: &[(&[u8], &'static str)]) -> Option<&'static str> {
-    for &(pattern, name) in table {
-        if input.eq_ignore_ascii_case(pattern) {
-            return Some(name);
-        }
-    }
-    None
+    debug_assert!(
+        table.windows(2).all(|w| w[0].0 <= w[1].0),
+        "cmd_name_from_bytes table must be sorted alphabetically"
+    );
+    // Tables are sorted alphabetically (uppercase), so use binary search.
+    table
+        .binary_search_by(|(pattern, _)| {
+            pattern
+                .iter()
+                .zip(input.iter())
+                .map(|(&p, &i)| p.cmp(&i.to_ascii_uppercase()))
+                .find(|&ord| ord != std::cmp::Ordering::Equal)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok()
+        .map(|idx| table[idx].1)
 }
 
 /// The phase a command was in when the timeout fired.
@@ -353,7 +362,7 @@ pub enum CommandPhase {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimeoutCause {
     /// Command was sent but the server didn't respond in time.
-    ServerUnresponsive { node: Arc<str> },
+    ServerUnresponsive { node: String },
     /// Command never left the client — Tokio or connection pool bottleneck.
     ClientBackpressure {
         queue_depth: usize,
@@ -371,7 +380,7 @@ pub struct TimeoutEvent {
     /// The command that timed out (e.g. "GET", "SET").
     pub command: &'static str,
     /// Target node address.
-    pub node: Arc<str>,
+    pub node: String,
     /// What phase the command was in when the timeout fired.
     pub phase: CommandPhase,
     /// The timeout duration that was configured.
@@ -705,6 +714,7 @@ impl TimeoutWatchdog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     // ── Basic Firing Behavior ────────────────────────────────────────────
 
