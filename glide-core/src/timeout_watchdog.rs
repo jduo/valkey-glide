@@ -570,14 +570,11 @@ fn get_rss() -> Option<u64> {
 // ─── Deadline Entry ──────────────────────────────────────────────────────────
 
 /// Internal entry sent from callers to the watchdog thread.
-/// Holds a Weak<redis::Cmd> to read diagnostic state at fire time.
-/// Per-client enrichment (p99, inflight-at-timeout) is done on the consumer
-/// side after the event is received — not here — to avoid Arc clones on the
-/// hot path.
+/// Minimal struct: only what the watchdog needs that can't be read from the Cmd.
+/// Command name is read from Cmd at fire time via cmd_name_from_bytes.
 struct DeadlineEntry {
     deadline: Instant,
     sender: oneshot::Sender<TimeoutEvent>,
-    command: &'static str,
     cmd: std::sync::Weak<redis::Cmd>,
     submitted_at: Instant,
     inflight_at_register: Option<usize>,
@@ -620,35 +617,28 @@ impl TimeoutWatchdog {
         Self { tx }
     }
 
-    /// Register a timeout with diagnostic context. Returns a
-    /// `oneshot::Receiver<TimeoutEvent>` that resolves with diagnostics if the
-    /// deadline fires.
+    /// Register a timeout. Returns a `oneshot::Receiver<TimeoutEvent>` that
+    /// resolves with diagnostics if the deadline fires.
     ///
-    /// The caller must wrap the `Cmd` in an `Arc` before calling this, and pass
-    /// `Arc::downgrade(&cmd)` as the `cmd` parameter. The watchdog reads
-    /// diagnostic state (phase, node, retry_count) directly from the Cmd at
-    /// fire time. If the Cmd has been dropped (command completed), the entry is
-    /// skipped.
+    /// `submitted_at` should be the caller's `Instant::now()` — shared with
+    /// the latency tracking timer to avoid a redundant clock read.
     ///
-    /// Per-client enrichment (p99 latency, inflight-at-timeout) is done on the
-    /// consumer side after the timeout event is received — not on the watchdog
-    /// thread — eliminating Arc clones from the hot path entirely.
+    /// Command name and diagnostic state are read from the `Cmd` (via the
+    /// `Weak` reference) at fire time, not sent through the channel.
     #[inline]
     pub fn register(
         &self,
         timeout: Duration,
-        command: &'static str,
         cmd: std::sync::Weak<redis::Cmd>,
+        submitted_at: Instant,
         inflight_count: Option<usize>,
     ) -> oneshot::Receiver<TimeoutEvent> {
         let (sender, rx) = oneshot::channel();
-        let submitted_at = Instant::now();
         let deadline = submitted_at + timeout;
 
         let _ = self.tx.send(DeadlineEntry {
             deadline,
             sender,
-            command,
             cmd,
             submitted_at,
             inflight_at_register: inflight_count,
@@ -753,7 +743,7 @@ impl TimeoutWatchdog {
 
         // Try to read diagnostic state from the Cmd. If the Arc was dropped
         // (command completed), use defaults.
-        let (phase_val, node, retry_count) = if let Some(cmd) = entry.cmd.upgrade() {
+        let (phase_val, node, retry_count, command) = if let Some(cmd) = entry.cmd.upgrade() {
             let p = cmd.watchdog_phase.load(Ordering::Acquire);
             let n: Arc<str> = cmd
                 .watchdog_node
@@ -761,9 +751,10 @@ impl TimeoutWatchdog {
                 .map(|s| Arc::from(s.as_str()))
                 .unwrap_or_else(|| UNKNOWN_NODE.clone());
             let r = cmd.watchdog_retry_count.load(Ordering::Relaxed);
-            (p, n, r)
+            let c = cmd.arg_idx(0).map(cmd_name_from_bytes).unwrap_or("UNKNOWN");
+            (p, n, r, c)
         } else {
-            (PHASE_QUEUED, UNKNOWN_NODE.clone(), 0)
+            (PHASE_QUEUED, UNKNOWN_NODE.clone(), 0, "UNKNOWN")
         };
 
         let phase = if phase_val == PHASE_SENT {
@@ -783,7 +774,7 @@ impl TimeoutWatchdog {
 
         TimeoutEvent {
             cause,
-            command: entry.command,
+            command,
             node,
             phase,
             configured_timeout,
@@ -810,7 +801,7 @@ impl TimeoutWatchdog {
         let configured_timeout = entry.deadline.duration_since(entry.submitted_at);
 
         // Try to read diagnostic state from the Cmd.
-        let (phase_val, node, retry_count) = if let Some(cmd) = entry.cmd.upgrade() {
+        let (phase_val, node, retry_count, command) = if let Some(cmd) = entry.cmd.upgrade() {
             let p = cmd.watchdog_phase.load(Ordering::Acquire);
             let n: Arc<str> = cmd
                 .watchdog_node
@@ -818,9 +809,10 @@ impl TimeoutWatchdog {
                 .map(|s| Arc::from(s.as_str()))
                 .unwrap_or_else(|| UNKNOWN_NODE.clone());
             let r = cmd.watchdog_retry_count.load(Ordering::Relaxed);
-            (p, n, r)
+            let c = cmd.arg_idx(0).map(cmd_name_from_bytes).unwrap_or("UNKNOWN");
+            (p, n, r, c)
         } else {
-            (PHASE_QUEUED, UNKNOWN_NODE.clone(), 0)
+            (PHASE_QUEUED, UNKNOWN_NODE.clone(), 0, "UNKNOWN")
         };
 
         let phase = if phase_val == PHASE_SENT {
@@ -868,7 +860,7 @@ impl TimeoutWatchdog {
 
         TimeoutEvent {
             cause,
-            command: entry.command,
+            command,
             node,
             phase,
             configured_timeout,
@@ -940,7 +932,12 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
         cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(Duration::from_millis(50), "GET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(50),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         assert_eq!(event.command, "GET");
@@ -957,8 +954,8 @@ mod tests {
         let cmd = make_cmd();
         let mut rx = watchdog.register(
             Duration::from_millis(200),
-            "GET",
             Arc::downgrade(&cmd),
+            Instant::now(),
             None,
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -974,14 +971,14 @@ mod tests {
         cmd2.mark_sent("127.0.0.1:6379");
         let rx1 = watchdog.register(
             Duration::from_millis(30),
-            "GET",
             Arc::downgrade(&cmd1),
+            Instant::now(),
             None,
         );
         let rx2 = watchdog.register(
             Duration::from_millis(60),
-            "SET",
             Arc::downgrade(&cmd2),
+            Instant::now(),
             None,
         );
 
@@ -1001,8 +998,8 @@ mod tests {
         let cmd = make_cmd();
         let rx = watchdog.register(
             Duration::from_millis(200),
-            "GET",
             Arc::downgrade(&cmd),
+            Instant::now(),
             None,
         );
         drop(rx);
@@ -1015,7 +1012,12 @@ mod tests {
     async fn phase_defaults_to_queued() {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
-        let rx = watchdog.register(Duration::from_millis(30), "SET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         assert_eq!(event.phase, CommandPhase::Queued);
@@ -1026,7 +1028,12 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
         cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(Duration::from_millis(30), "SET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         assert_eq!(event.phase, CommandPhase::Sent);
@@ -1036,7 +1043,12 @@ mod tests {
     async fn late_phase_transition_captured() {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
-        let rx = watchdog.register(Duration::from_millis(80), "SET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(80),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         cmd.mark_sent("127.0.0.1:6379");
@@ -1051,7 +1063,12 @@ mod tests {
     async fn classifies_client_backpressure_when_queued() {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
-        let rx = watchdog.register(Duration::from_millis(30), "SET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         assert!(matches!(
@@ -1065,7 +1082,12 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
         cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(Duration::from_millis(30), "GET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         assert!(matches!(
@@ -1082,8 +1104,12 @@ mod tests {
         for _ in 0..10 {
             let cmd = make_cmd();
             cmd.mark_sent("10.0.0.1:6379");
-            let rx =
-                watchdog.register(Duration::from_millis(50), "GET", Arc::downgrade(&cmd), None);
+            let rx = watchdog.register(
+                Duration::from_millis(50),
+                Arc::downgrade(&cmd),
+                Instant::now(),
+                None,
+            );
             cmds.push(cmd);
             receivers.push(rx);
         }
@@ -1103,8 +1129,12 @@ mod tests {
         for i in 0..110 {
             let cmd = make_cmd();
             cmd.mark_sent(&format!("10.0.0.{}:6379", i % 50));
-            let rx =
-                watchdog.register(Duration::from_millis(50), "GET", Arc::downgrade(&cmd), None);
+            let rx = watchdog.register(
+                Duration::from_millis(50),
+                Arc::downgrade(&cmd),
+                Instant::now(),
+                None,
+            );
             cmds.push(cmd);
             receivers.push(rx);
         }
@@ -1122,8 +1152,8 @@ mod tests {
         cmd_target.mark_sent("10.0.0.1:6379");
         let rx_target = watchdog.register(
             Duration::from_millis(50),
-            "GET",
             Arc::downgrade(&cmd_target),
+            Instant::now(),
             None,
         );
         let mut _holders = Vec::new();
@@ -1131,16 +1161,24 @@ mod tests {
         for _ in 0..2 {
             let cmd = make_cmd();
             cmd.mark_sent("10.0.0.1:6379");
-            let rx =
-                watchdog.register(Duration::from_millis(50), "GET", Arc::downgrade(&cmd), None);
+            let rx = watchdog.register(
+                Duration::from_millis(50),
+                Arc::downgrade(&cmd),
+                Instant::now(),
+                None,
+            );
             _cmd_holders.push(cmd);
             _holders.push(rx);
         }
         for _ in 0..2 {
             let cmd = Arc::new(redis::cmd("SET"));
             cmd.mark_sent("10.0.0.2:6379");
-            let rx =
-                watchdog.register(Duration::from_millis(50), "SET", Arc::downgrade(&cmd), None);
+            let rx = watchdog.register(
+                Duration::from_millis(50),
+                Arc::downgrade(&cmd),
+                Instant::now(),
+                None,
+            );
             _cmd_holders.push(cmd);
             _holders.push(rx);
         }
@@ -1193,7 +1231,12 @@ mod tests {
 
         let cmd = make_cmd();
         cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(Duration::from_millis(30), "GET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         // p99 enrichment is now done by the consumer (client/mod.rs),
@@ -1209,7 +1252,12 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
         cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(Duration::from_millis(20), "GET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(20),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         assert!(event.suggested_timeout.is_none());
@@ -1234,7 +1282,12 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
         cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(Duration::from_millis(30), "GET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         assert!(event.suggested_timeout.is_none());
@@ -1247,7 +1300,12 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
         cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(Duration::from_millis(30), "GET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         if cfg!(any(target_os = "linux", target_os = "macos")) {
@@ -1268,7 +1326,12 @@ mod tests {
         let mut cmds = Vec::with_capacity(10_000);
         for _ in 0..10_000 {
             let cmd = make_cmd();
-            let rx = watchdog.register(Duration::from_secs(60), "GET", Arc::downgrade(&cmd), None);
+            let rx = watchdog.register(
+                Duration::from_secs(60),
+                Arc::downgrade(&cmd),
+                Instant::now(),
+                None,
+            );
             cmds.push(cmd);
             receivers.push(rx);
         }
@@ -1287,7 +1350,12 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         for _ in 0..1000 {
             let cmd = make_cmd();
-            let _rx = watchdog.register(Duration::from_secs(1), "GET", Arc::downgrade(&cmd), None);
+            let _rx = watchdog.register(
+                Duration::from_secs(1),
+                Arc::downgrade(&cmd),
+                Instant::now(),
+                None,
+            );
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1296,8 +1364,8 @@ mod tests {
         cmd.mark_sent("127.0.0.1:6379");
         let rx = watchdog.register(
             Duration::from_millis(30),
-            "PING",
             Arc::downgrade(&cmd),
+            Instant::now(),
             None,
         );
         let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
@@ -1319,8 +1387,12 @@ mod tests {
                 for _ in 0..100 {
                     let cmd = Arc::new(redis::cmd("GET"));
                     cmd.mark_sent("127.0.0.1:6379");
-                    let rx =
-                        w.register(Duration::from_millis(50), "GET", Arc::downgrade(&cmd), None);
+                    let rx = w.register(
+                        Duration::from_millis(50),
+                        Arc::downgrade(&cmd),
+                        Instant::now(),
+                        None,
+                    );
                     cmds.push(cmd);
                     rxs.push(rx);
                 }
@@ -1342,8 +1414,8 @@ mod tests {
         let cmd = make_cmd();
         let rx = watchdog.register(
             Duration::from_millis(100),
-            "PING",
             Arc::downgrade(&cmd),
+            Instant::now(),
             None,
         );
 
@@ -1369,8 +1441,8 @@ mod tests {
         let cmd = make_cmd();
         let rx = watchdog.register(
             Duration::from_millis(80),
-            "CLUSTER SLOTS",
             Arc::downgrade(&cmd),
+            Instant::now(),
             None,
         );
 
@@ -1390,7 +1462,7 @@ mod tests {
             event.cause,
             TimeoutCause::ClientBackpressure { .. }
         ));
-        assert_eq!(event.command, "CLUSTER SLOTS");
+        assert_eq!(event.command, "GET");
         blocker.abort();
     }
 
@@ -1401,7 +1473,12 @@ mod tests {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
         cmd.mark_sent("127.0.0.1:6379");
-        let rx = watchdog.register(Duration::from_millis(30), "GET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         let debug_str = format!("{:?}", event);
@@ -1416,7 +1493,12 @@ mod tests {
     async fn inline_cmd_fields_set_node_and_phase() {
         let watchdog = TimeoutWatchdog::start();
         let cmd = Arc::new(redis::cmd("SET"));
-        let rx = watchdog.register(Duration::from_millis(50), "SET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(50),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         cmd.mark_sent("10.0.0.5:6379");
 
@@ -1464,7 +1546,12 @@ mod tests {
     async fn timeout_without_mark_sent_reports_queued_and_unknown_node() {
         let watchdog = TimeoutWatchdog::start();
         let cmd = make_cmd();
-        let rx = watchdog.register(Duration::from_millis(30), "GET", Arc::downgrade(&cmd), None);
+        let rx = watchdog.register(
+            Duration::from_millis(30),
+            Arc::downgrade(&cmd),
+            Instant::now(),
+            None,
+        );
 
         let event = rx.await.unwrap();
         assert_eq!(event.phase, CommandPhase::Queued);
@@ -1482,8 +1569,8 @@ mod tests {
         cmd.mark_sent("127.0.0.1:6379");
         let rx = watchdog.register(
             Duration::from_millis(30),
-            "GET",
             Arc::downgrade(&cmd),
+            Instant::now(),
             Some(42),
         );
 

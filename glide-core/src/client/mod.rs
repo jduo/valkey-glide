@@ -1120,12 +1120,6 @@ impl Client {
             let result =
                 match request_timeout {
                     Some(duration) => {
-                        // Resolve command name from raw bytes (zero allocation)
-                        let cmd_name = owned_cmd
-                            .arg_idx(0)
-                            .map(crate::timeout_watchdog::cmd_name_from_bytes)
-                            .unwrap_or("UNKNOWN");
-
                         // Compute inflight count (cheap atomic load)
                         let inflight = Some(
                             (self.inflight_requests_limit
@@ -1136,8 +1130,11 @@ impl Client {
                         // Wrap Cmd in Arc BEFORE register so we can pass a Weak reference
                         let owned_cmd = Arc::new(owned_cmd);
 
+                        // Single Instant::now() shared between watchdog and latency tracking
+                        let cmd_start = Instant::now();
+
                         let timeout_rx = crate::timeout_watchdog::TimeoutWatchdog::global()
-                            .register(duration, cmd_name, Arc::downgrade(&owned_cmd), inflight);
+                            .register(duration, Arc::downgrade(&owned_cmd), cmd_start, inflight);
                         let execute = Self::execute_command_owned(
                             self_clone,
                             owned_cmd,
@@ -1146,7 +1143,6 @@ impl Client {
                             compression_manager,
                         );
 
-                        let cmd_start = Instant::now();
                         tokio::pin!(execute);
                         tokio::select! {
                             result = &mut execute => {

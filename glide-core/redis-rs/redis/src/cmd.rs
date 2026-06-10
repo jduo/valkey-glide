@@ -29,7 +29,12 @@ pub enum Arg<D> {
 #[derive(Clone)]
 pub enum NodeAddr {
     /// Stack-allocated address (up to 63 bytes).
-    Inline { buf: [u8; 63], len: u8 },
+    Inline {
+        /// Raw UTF-8 bytes of the address.
+        buf: [u8; 63],
+        /// Length of the address in bytes.
+        len: u8,
+    },
     /// Heap-allocated for addresses > 63 bytes (extremely rare in practice).
     Heap(String),
 }
@@ -726,9 +731,9 @@ impl Cmd {
         })
     }
 
-    // Get a reference to the argument at `idx`
+    /// Get a reference to the argument at `idx`.
     #[cfg(feature = "cluster")]
-    pub(crate) fn arg_idx(&self, idx: usize) -> Option<&[u8]> {
+    pub fn arg_idx(&self, idx: usize) -> Option<&[u8]> {
         if idx >= self.args.len() {
             return None;
         }
