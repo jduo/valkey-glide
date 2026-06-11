@@ -1,5 +1,8 @@
 ## 2.3.1
 
+#### Fixes
+* Core/FFI: Fix heap corruption in `convert_vec_to_pointer` where `shrink_to_fit()` (a non-binding hint) was followed by `Vec::from_raw_parts` with `capacity = len`. When the allocator kept extra capacity, deallocation passed the wrong size, corrupting heap metadata and causing delayed SIGABRT crashes after many pubsub messages or response frees. ([#5637](https://github.com/valkey-io/valkey-glide/pull/5637))
+
 #### Changes
 * CORE: Add OpenTelemetry DB semantic convention attributes to command spans ([#5416](https://github.com/valkey-io/valkey-glide/issues/5416))
 * CORE: Prevent zombie subcommand accumulation with InflightTracker ([#5632](https://github.com/valkey-io/valkey-glide/issues/5632))
