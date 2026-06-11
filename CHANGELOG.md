@@ -1,6 +1,7 @@
 ## Pending 2.2
 
 #### Fixes
+* Core/FFI: Fix heap corruption in `convert_vec_to_pointer` where `shrink_to_fit()` (a non-binding hint) was followed by `Vec::from_raw_parts` with `capacity = len`. When the allocator kept extra capacity, deallocation passed the wrong size, corrupting heap metadata and causing delayed SIGABRT crashes after many pubsub messages or response frees. ([#5637](https://github.com/valkey-io/valkey-glide/pull/5637))
 * CORE: Fall back to existing cluster connections when initial nodes are unavailable during topology refresh. When `refreshTopologyFromInitialNodes=true` and the initial/seed node is unreachable (e.g., dead primary during failover), the topology refresh now queries healthy existing connections instead of failing silently. This complements #5836 to enable failover recovery when the seed node itself is the failed node. ([#5814](https://github.com/valkey-io/valkey-glide/pull/5814))
 
 #### Operational Enhancements
