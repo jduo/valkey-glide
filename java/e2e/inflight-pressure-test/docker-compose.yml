@@ -1,0 +1,27 @@
+services:
+  valkey:
+    image: valkey/valkey:8
+    command:
+      - sh
+      - -c
+      - |
+        valkey-server --cluster-enabled yes --cluster-node-timeout 5000 --appendonly no --port 6379 --daemonize yes --maxmemory 256mb
+        sleep 1
+        valkey-cli cluster addslots $(seq 0 16383) >/dev/null
+        tail -f /dev/null
+    ports: ["6379:6379"]
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  test:
+    build: .
+    platform: linux/amd64
+    depends_on: [valkey]
+    command: ["valkey", "6379"]
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 1400m

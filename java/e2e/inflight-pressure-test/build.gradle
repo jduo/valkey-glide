@@ -1,0 +1,22 @@
+plugins { id 'application' }
+java { toolchain { languageVersion = JavaLanguageVersion.of(11) } }
+repositories { mavenCentral() }
+dependencies {
+  implementation files('glide-local.jar')
+}
+application { mainClass = System.getProperty('mainClass') ?: 'InflightPressureTest' }
+tasks.register('fatJar', Jar) {
+  archiveFileName = 'test.jar'
+  manifest { attributes 'Main-Class': System.getProperty('mainClass') ?: 'InflightPressureTest' }
+  duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+  from sourceSets.main.output
+  from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
+}
+// Build a separate jar for the deterministic CLIENT PAUSE test
+tasks.register('fatJarLimit', Jar) {
+  archiveFileName = 'limit-test.jar'
+  manifest { attributes 'Main-Class': 'InflightLimitTest' }
+  duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+  from sourceSets.main.output
+  from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
+}
